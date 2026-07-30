@@ -1454,6 +1454,33 @@ def assert_outputs_are_printed(expected_outputs: dict[str, str], stderr: str):
             id="Run go unit and e2e tests for go-sdk source change",
         ),
         pytest.param(
+            ("go-sdk/go.mod",),
+            {
+                "run-go-sdk-tests": "true",
+                "run-go-sdk-e2e-tests": "true",
+                "prod-image-build": "true",
+            },
+            id="Run go unit and e2e tests for go-sdk dependency change",
+        ),
+        pytest.param(
+            ("go-sdk/README.md",),
+            {
+                "run-go-sdk-tests": "false",
+                "run-go-sdk-e2e-tests": "false",
+                "prod-image-build": "false",
+            },
+            id="Skip go unit and e2e tests for go-sdk README-only change",
+        ),
+        pytest.param(
+            ("go-sdk/adr/0001-bundle-packing-options.md",),
+            {
+                "run-go-sdk-tests": "false",
+                "run-go-sdk-e2e-tests": "false",
+                "prod-image-build": "false",
+            },
+            id="Skip go unit and e2e tests for go-sdk ADR-only change",
+        ),
+        pytest.param(
             ("airflow-e2e-tests/docker/go.yml",),
             {
                 "run-go-sdk-tests": "false",
@@ -1827,6 +1854,37 @@ def test_full_test_needed_when_scripts_changes(files: tuple[str, ...], expected_
         default_branch="main",
     )
     assert_outputs_are_printed(expected_outputs, str(stderr))
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        pytest.param(
+            ("scripts/ci/prek/check_provider_yaml_files.py",),
+            id="provider yaml check script changed",
+        ),
+        pytest.param(
+            ("providers/.pre-commit-config.yaml",),
+            id="providers prek config changed",
+        ),
+        pytest.param(
+            (
+                "scripts/ci/prek/check_provider_yaml_files.py",
+                "providers/.pre-commit-config.yaml",
+            ),
+            id="provider yaml check script and providers prek config changed together",
+        ),
+    ],
+)
+def test_provider_yaml_check_not_skipped_when_check_scripts_change(files: tuple[str, ...]):
+    stderr = SelectiveChecks(
+        files=files,
+        github_event=GithubEvents.PULL_REQUEST,
+        commit_ref=NEUTRAL_COMMIT,
+        default_branch="main",
+    )
+    skip_prek_hooks = str(stderr).split("skip-prek-hooks=")[1].split("\n")[0]
+    assert "check-provider-yaml-valid" not in skip_prek_hooks.split(",")
 
 
 @pytest.mark.parametrize(
@@ -3542,6 +3600,19 @@ def test_run_kubernetes_tests_forced_by_label_with_no_changed_files():
         pr_labels=("area:kubernetes-tests",),
     )
     assert checks.run_kubernetes_tests is True
+    assert checks.full_tests_needed is False
+
+
+@pytest.mark.parametrize("files", [("INTHEWILD.md",), ()], ids=["unrelated-file", "no-files"])
+def test_prod_image_build_forced_by_e2e_tests_label(files):
+    checks = SelectiveChecks(
+        files=files,
+        commit_ref=NEUTRAL_COMMIT,
+        github_event=GithubEvents.PULL_REQUEST,
+        default_branch="main",
+        pr_labels=("area:e2e-tests",),
+    )
+    assert checks.prod_image_build is True
     assert checks.full_tests_needed is False
 
 

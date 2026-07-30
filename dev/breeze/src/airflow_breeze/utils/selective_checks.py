@@ -92,6 +92,7 @@ UPGRADE_TO_NEWER_DEPENDENCIES_LABEL = "upgrade to newer dependencies"
 USE_PUBLIC_RUNNERS_LABEL = "use public runners"
 ALLOW_PROVIDER_DEPENDENCY_BUMP_LABEL = "allow provider dependency bump"
 SKIP_COMMON_COMPAT_CHECK_LABEL = "skip common compat check"
+AREA_E2E_TESTS_LABEL = "area:e2e-tests"
 AREA_KUBERNETES_TESTS_LABEL = "area:kubernetes-tests"
 ALL_CI_SELECTIVE_TEST_TYPES = "API Always CLI Core Other Serialization"
 
@@ -242,7 +243,8 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
             r"^task-sdk/src/airflow/sdk/coordinators/java/.*",
         ],
         FileGroupForCi.GO_SDK_E2E_FILES: [
-            r"^go-sdk/.*",
+            # `.md` excluded — doc-only edits do not affect the Go build or e2e tests.
+            r"^go-sdk/(?!.*\.md$).*",
             r"^airflow-e2e-tests/tests/airflow_e2e_tests/go_sdk_tests/.*",
             r"^airflow-e2e-tests/docker/go\.yml$",
             r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
@@ -354,6 +356,7 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
         FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES: [
             r"^providers/.*/pyproject\.toml$",
             r"^providers/.*/provider\.yaml$",
+            r"^providers/\.pre-commit-config\.yaml$",
         ],
         FileGroupForCi.ALL_DEV_PYTHON_FILES: [
             r"^dev/.*\.py$",
@@ -418,7 +421,9 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
             r"^task-sdk-integration-tests/.*\.py$",
         ],
         FileGroupForCi.GO_SDK_FILES: [
-            r"^go-sdk/.*\.go$",
+            # `.md` excluded — doc-only edits do not affect the Go build or tests, but
+            # everything else (go.mod, go.sum, build config) must trigger the unit tests.
+            r"^go-sdk/(?!.*\.md$).*",
         ],
         FileGroupForCi.JAVA_SDK_FILES: [
             r"^java-sdk/",
@@ -1136,6 +1141,12 @@ class SelectiveChecks:
 
     @cached_property
     def prod_image_build(self) -> bool:
+        if AREA_E2E_TESTS_LABEL in self._pr_labels:
+            console_print(
+                "[warning]Building the PROD image to run Airflow E2E tests because "
+                f"label '{AREA_E2E_TESTS_LABEL}' is in {self._pr_labels}[/]"
+            )
+            return True
         return (
             self.run_kubernetes_tests
             or self.run_helm_tests
@@ -1596,9 +1607,12 @@ class SelectiveChecks:
                 FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES, CI_FILE_GROUP_MATCHES
             )
             or self._matching_files(FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES, CI_FILE_GROUP_MATCHES)
+            or self._matching_files(FileGroupForCi.PREK_FILES, CI_FILE_GROUP_MATCHES)
         ):
-            # only skip provider validation if none of the provider.yaml and provider
-            # python files changed because validation also walks through all the provider python files
+            # Skip provider validation only when none of these changed:
+            # - provider.yaml / pyproject.toml / providers/.pre-commit-config.yaml
+            # - provider Python files (validation walks all provider Python files)
+            # - prek scripts (the check script itself may have changed)
             prek_hooks_to_skip.add("check-provider-yaml-valid")
         # Non-provider mypy checks run as prek hooks in static checks.
         # Skip them when their relevant files haven't changed, unless devel-common
