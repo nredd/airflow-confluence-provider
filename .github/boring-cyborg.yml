@@ -90,6 +90,9 @@ labelPRBasedOnFilePath:
   provider:asana:
     - providers/asana/**
 
+  provider:atlassian-confluence:
+    - providers/atlassian/confluence/**
+
   provider:atlassian-jira:
     - providers/atlassian/jira/**
 

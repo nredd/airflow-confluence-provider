@@ -167,6 +167,9 @@ apache-airflow = "airflow.__main__:main"
 "asana" = [
     "apache-airflow-providers-asana>=2.7.0"
 ]
+"atlassian.confluence" = [
+    "apache-airflow-providers-atlassian-confluence>=0.1.0"
+]
 "atlassian.jira" = [
     "apache-airflow-providers-atlassian-jira>=2.7.1"
 ]
@@ -436,6 +439,7 @@ apache-airflow = "airflow.__main__:main"
     "apache-airflow-providers-apprise>=1.4.1",
     "apache-airflow-providers-arangodb>=2.7.0",
     "apache-airflow-providers-asana>=2.7.0",
+    "apache-airflow-providers-atlassian-confluence>=0.1.0",
     "apache-airflow-providers-atlassian-jira>=2.7.1",
     "apache-airflow-providers-celery>=3.8.3",
     "apache-airflow-providers-clickhousedb>=1.0.0",
@@ -1138,6 +1142,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/arangodb/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/asana/src",
     "$MYPY_CONFIG_FILE_DIR/providers/asana/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/atlassian/confluence/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/atlassian/confluence/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/atlassian/jira/src",
     "$MYPY_CONFIG_FILE_DIR/providers/atlassian/jira/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/celery/src",
@@ -1460,6 +1466,7 @@ apache-airflow-providers-apache-tinkerpop = false
 apache-airflow-providers-apprise = false
 apache-airflow-providers-arangodb = false
 apache-airflow-providers-asana = false
+apache-airflow-providers-atlassian-confluence = false
 apache-airflow-providers-atlassian-jira = false
 apache-airflow-providers-celery = false
 apache-airflow-providers-clickhousedb = false
@@ -1612,6 +1619,7 @@ apache-airflow-providers-apache-tinkerpop = false
 apache-airflow-providers-apprise = false
 apache-airflow-providers-arangodb = false
 apache-airflow-providers-asana = false
+apache-airflow-providers-atlassian-confluence = false
 apache-airflow-providers-atlassian-jira = false
 apache-airflow-providers-celery = false
 apache-airflow-providers-clickhousedb = false
@@ -1775,6 +1783,7 @@ apache-airflow-providers-apache-tinkerpop = { workspace = true }
 apache-airflow-providers-apprise = { workspace = true }
 apache-airflow-providers-arangodb = { workspace = true }
 apache-airflow-providers-asana = { workspace = true }
+apache-airflow-providers-atlassian-confluence = { workspace = true }
 apache-airflow-providers-atlassian-jira = { workspace = true }
 apache-airflow-providers-celery = { workspace = true }
 apache-airflow-providers-clickhousedb = { workspace = true }
@@ -1916,6 +1925,7 @@ members = [
     "providers/apprise",
     "providers/arangodb",
     "providers/asana",
+    "providers/atlassian/confluence",
     "providers/atlassian/jira",
     "providers/celery",
     "providers/clickhousedb",
