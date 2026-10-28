@@ -21,7 +21,7 @@ name: Atlassian Confluence
 description: |
     `Atlassian Confluence <https://www.atlassian.com/software/confluence>`__
 
-state: ready
+state: not-ready
 lifecycle: incubation
 source-date-epoch: 1784746595
 # Note that those versions are maintained by release manager - do not update them manually

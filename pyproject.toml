@@ -172,9 +172,6 @@ apache-airflow = "airflow.__main__:main"
 "asana" = [
     "apache-airflow-providers-asana>=2.7.0"
 ]
-"atlassian.confluence" = [
-    "apache-airflow-providers-atlassian-confluence>=0.1.0"
-]
 "atlassian.jira" = [
     "apache-airflow-providers-atlassian-jira>=2.7.1"
 ]
@@ -452,7 +449,6 @@ apache-airflow = "airflow.__main__:main"
     "apache-airflow-providers-apprise>=1.4.1",
     "apache-airflow-providers-arangodb>=2.7.0",
     "apache-airflow-providers-asana>=2.7.0",
-    "apache-airflow-providers-atlassian-confluence>=0.1.0",
     "apache-airflow-providers-atlassian-jira>=2.7.1",
     "apache-airflow-providers-celery>=3.8.3",
     "apache-airflow-providers-clickhousedb>=1.0.0",
