@@ -135,6 +135,7 @@ body:
         - apprise
         - arangodb
         - asana
+        - atlassian-confluence
         - atlassian-jira
         - celery
         - clickhousedb

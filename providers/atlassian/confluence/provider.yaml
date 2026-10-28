@@ -1,0 +1,88 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+---
+package-name: apache-airflow-providers-atlassian-confluence
+name: Atlassian Confluence
+description: |
+    `Atlassian Confluence <https://www.atlassian.com/software/confluence>`__
+
+state: ready
+lifecycle: incubation
+source-date-epoch: 1784746595
+# Note that those versions are maintained by release manager - do not update them manually
+versions:
+  - 0.1.0
+
+integrations:
+  - integration-name: Atlassian Confluence
+    external-doc-url: https://www.atlassian.com/software/confluence
+    logo: /docs/integration-logos/Confluence.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-atlassian-confluence/operators/confluence.rst
+    tags: [software]
+
+operators:
+  - integration-name: Atlassian Confluence
+    python-modules:
+      - airflow.providers.atlassian.confluence.operators.confluence
+
+sensors:
+  - integration-name: Atlassian Confluence
+    python-modules:
+      - airflow.providers.atlassian.confluence.sensors.confluence
+
+hooks:
+  - integration-name: Atlassian Confluence
+    python-modules:
+      - airflow.providers.atlassian.confluence.hooks.confluence
+
+connection-types:
+  - hook-class-name: airflow.providers.atlassian.confluence.hooks.confluence.ConfluenceHook
+    hook-name: "Confluence"
+    connection-type: confluence
+    conn-fields:
+      verify:
+        label: Verify SSL
+        schema:
+          type:
+            - boolean
+            - 'null'
+          default: true
+      token:
+        label: API token / Personal Access Token
+        schema:
+          type:
+            - string
+            - 'null'
+          format: password
+        description: >
+          Confluence Cloud API token or Data Center Personal Access Token. When set, it takes
+          precedence over Login/Password and is used as the sole credential.
+      cloud:
+        label: Confluence Cloud
+        schema:
+          type:
+            - boolean
+            - 'null'
+          default: false
+        description: >
+          Set for Confluence Cloud instances. Atlassian-hosted URLs are detected automatically,
+          so this is only needed for Cloud instances behind a custom domain.
+    ui-field-behaviour:
+      hidden-fields:
+        - schema
