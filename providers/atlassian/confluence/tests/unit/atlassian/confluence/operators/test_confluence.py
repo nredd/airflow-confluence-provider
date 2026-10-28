@@ -115,7 +115,7 @@ class TestConfluenceOperator:
         inner.execute.assert_called_once_with()
 
     def test_method_args_are_templated(self):
-        assert "confluence_method_args" in ConfluenceOperator.template_fields
+        assert {"confluence_method_args", "confluence_conn_id"} <= set(ConfluenceOperator.template_fields)
 
 
 class TestConfluencePageOperator:
@@ -191,7 +191,9 @@ class TestConfluencePageOperator:
             operator.execute(context={})
 
     def test_body_and_title_are_templated(self):
-        assert {"title", "body", "parent_id", "parent_title"} <= set(ConfluencePageOperator.template_fields)
+        assert {"title", "body", "parent_id", "parent_title", "confluence_conn_id"} <= set(
+            ConfluencePageOperator.template_fields
+        )
 
 
 class TestConfluenceBlogPostOperator:
@@ -217,4 +219,4 @@ class TestConfluenceBlogPostOperator:
         mocked_confluence_client.create_page.assert_not_called()
 
     def test_body_and_title_are_templated(self):
-        assert {"title", "body"} <= set(ConfluenceBlogPostOperator.template_fields)
+        assert {"title", "body", "confluence_conn_id"} <= set(ConfluenceBlogPostOperator.template_fields)

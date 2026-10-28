@@ -90,4 +90,4 @@ class TestConfluencePageSensor:
         assert sensor.poke(context={}) is True
 
     def test_method_params_are_templated(self):
-        assert "method_params" in ConfluencePageSensor.template_fields
+        assert {"method_params", "confluence_conn_id"} <= set(ConfluencePageSensor.template_fields)

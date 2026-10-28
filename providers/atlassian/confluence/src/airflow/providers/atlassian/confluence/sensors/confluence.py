@@ -43,7 +43,7 @@ class ConfluencePageSensor(BaseSensorOperator):
     :param result_processor: called with the response; return a truthy value to stop poking
     """
 
-    template_fields: Sequence[str] = ("method_params",)
+    template_fields: Sequence[str] = ("method_params", "confluence_conn_id")
 
     def __init__(
         self,

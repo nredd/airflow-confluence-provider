@@ -50,7 +50,7 @@ class ConfluenceOperator(BaseOperator):
         on, instead of the top-level SDK client
     """
 
-    template_fields: Sequence[str] = ("confluence_method_args",)
+    template_fields: Sequence[str] = ("confluence_method_args", "confluence_conn_id")
 
     def __init__(
         self,
@@ -108,7 +108,14 @@ class ConfluencePageOperator(BaseOperator):
     :param version_comment: comment recorded against the new page version
     """
 
-    template_fields: Sequence[str] = ("title", "body", "parent_id", "parent_title", "version_comment")
+    template_fields: Sequence[str] = (
+        "title",
+        "body",
+        "parent_id",
+        "parent_title",
+        "version_comment",
+        "confluence_conn_id",
+    )
     template_fields_renderers = {"body": "html"}
 
     def __init__(
@@ -183,7 +190,7 @@ class ConfluenceBlogPostOperator(BaseOperator):
     :param version_comment: comment recorded against the new version
     """
 
-    template_fields: Sequence[str] = ("title", "body", "version_comment")
+    template_fields: Sequence[str] = ("title", "body", "version_comment", "confluence_conn_id")
     template_fields_renderers = {"body": "html"}
 
     def __init__(
