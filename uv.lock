@@ -4384,7 +4384,7 @@ docs = [
 requires-dist = [
     { name = "apache-airflow", editable = "." },
     { name = "apache-airflow-providers-common-compat", editable = "providers/common/compat" },
-    { name = "atlassian-python-api", specifier = ">=4.0.0" },
+    { name = "atlassian-python-api", specifier = ">=5.0.5" },
 ]
 
 [package.metadata.requires-dev]

@@ -20,203 +20,168 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
+from atlassian import ConfluenceServer
 
-from airflow.models import Connection
+from airflow.providers.atlassian.confluence.hooks.confluence import ConfluenceContent, ConfluenceHook
 from airflow.providers.atlassian.confluence.operators.confluence import (
     ConfluenceBlogPostOperator,
     ConfluenceOperator,
     ConfluencePageOperator,
 )
 
-from tests_common.test_utils.compat import connection_as_json
+OPERATORS = "airflow.providers.atlassian.confluence.operators.confluence"
 
-PAGE = {"id": "123", "title": "Report"}
-
-
-@pytest.fixture(autouse=True)
-def confluence_connection(monkeypatch):
-    monkeypatch.setenv(
-        "AIRFLOW_CONN_CONFLUENCE_DEFAULT",
-        connection_as_json(
-            Connection(
-                conn_id="confluence_default",
-                conn_type="confluence",
-                host="https://localhost/confluence/",
-                login="user",
-                password="password",
-            )
-        ),
-    )
+CONTENT = ConfluenceContent(
+    id="10",
+    type="page",
+    title="Report",
+    space="SPACE",
+    version=1,
+    url="https://example.atlassian.net/wiki/spaces/SPACE/pages/10",
+    action="created",
+)
 
 
-@pytest.fixture
-def mocked_confluence_client():
-    with mock.patch("airflow.providers.atlassian.confluence.hooks.confluence.Confluence", autospec=True) as m:
-        client = mock.Mock(name="confluence_client")
-        m.return_value = client
-        yield client
-
-
+@mock.patch(f"{OPERATORS}.ConfluenceHook", autospec=True)
 class TestConfluenceOperator:
-    def test_calls_the_named_method_on_the_client(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_by_id.return_value = PAGE
+    def test_calls_the_named_method_on_the_client(self, hook_cls):
+        client = mock.create_autospec(ConfluenceServer, instance=True)
+        client.get_page_by_id.return_value = {"id": "123"}
+        hook_cls.return_value.get_conn.return_value = client
         operator = ConfluenceOperator(
             task_id="get_page",
             confluence_method="get_page_by_id",
             confluence_method_args={"page_id": "123"},
+            confluence_conn_id="my_conn",
         )
 
-        assert operator.execute(context={}) == PAGE
-        mocked_confluence_client.get_page_by_id.assert_called_once_with(page_id="123")
+        assert operator.execute(context={}) == {"id": "123"}
+        hook_cls.assert_called_once_with(confluence_conn_id="my_conn")
+        client.get_page_by_id.assert_called_once_with(page_id="123")
 
-    def test_method_args_default_to_empty(self, mocked_confluence_client):
-        operator = ConfluenceOperator(task_id="ping", confluence_method="get_all_spaces")
+    def test_method_args_default_to_empty(self, hook_cls):
+        client = mock.create_autospec(ConfluenceServer, instance=True)
+        hook_cls.return_value.get_conn.return_value = client
 
-        operator.execute(context={})
+        ConfluenceOperator(task_id="ping", confluence_method="get_all_spaces").execute(context={})
 
-        mocked_confluence_client.get_all_spaces.assert_called_once_with()
+        client.get_all_spaces.assert_called_once_with()
 
-    def test_result_processor_replaces_the_return_value(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_by_id.return_value = PAGE
-        context: dict = {}
+    def test_result_processor_receives_context_and_result(self, hook_cls):
+        client = mock.create_autospec(ConfluenceServer, instance=True)
+        client.get_page_by_id.return_value = {"id": "123"}
+        hook_cls.return_value.get_conn.return_value = client
+        processor = mock.Mock(return_value="processed")
         operator = ConfluenceOperator(
-            task_id="get_title",
+            task_id="get_page",
             confluence_method="get_page_by_id",
             confluence_method_args={"page_id": "123"},
-            result_processor=lambda ctx, result: (ctx is context, result["title"]),
+            result_processor=processor,
         )
+        context = {"ds": "2026-01-01"}
 
-        assert operator.execute(context=context) == (True, "Report")
-
-    def test_resource_method_supplies_the_object_to_call(self, mocked_confluence_client):
-        resource = mock.Mock()
-        resource.custom_call.return_value = "ok"
-        operator = ConfluenceOperator(
-            task_id="custom",
-            confluence_method="custom_call",
-            get_confluence_resource_method=lambda **_: resource,
-        )
-
-        assert operator.execute(context={}) == "ok"
-        mocked_confluence_client.custom_call.assert_not_called()
-
-    def test_a_nested_operator_may_supply_the_resource(self, mocked_confluence_client):
-        resource = mock.Mock()
-        resource.custom_call.return_value = "ok"
-        inner = ConfluenceOperator(task_id="inner", confluence_method="unused")
-        inner.execute = mock.Mock(return_value=resource)
-        operator = ConfluenceOperator(
-            task_id="outer",
-            confluence_method="custom_call",
-            get_confluence_resource_method=inner,
-        )
-
-        assert operator.execute(context={}) == "ok"
-        inner.execute.assert_called_once_with()
-
-    def test_method_args_are_templated(self):
-        assert {"confluence_method_args", "confluence_conn_id"} <= set(ConfluenceOperator.template_fields)
+        assert operator.execute(context=context) == "processed"
+        processor.assert_called_once_with(context, {"id": "123"})
 
 
+@mock.patch(f"{OPERATORS}.ConfluenceHook", autospec=True)
 class TestConfluencePageOperator:
-    def test_upserts_a_top_level_page(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_by_title.return_value = None
-        mocked_confluence_client.create_page.return_value = PAGE
-        operator = ConfluencePageOperator(task_id="publish", space="SPACE", title="Report", body="<p>hi</p>")
-
-        assert operator.execute(context={}) == PAGE
-        assert mocked_confluence_client.create_page.call_args.kwargs["space"] == "SPACE"
-
-    def test_upserts_under_a_parent_id(self, mocked_confluence_client):
-        mocked_confluence_client.update_or_create.return_value = PAGE
-        operator = ConfluencePageOperator(
-            task_id="publish",
-            space="SPACE",
-            title="Report",
-            body="<p>hi</p>",
-            parent_id="42",
-            version_comment="nightly",
-        )
-
-        assert operator.execute(context={}) == PAGE
-        mocked_confluence_client.update_or_create.assert_called_once_with(
-            parent_id="42",
-            title="Report",
-            body="<p>hi</p>",
-            representation="storage",
-            minor_edit=False,
-            version_comment="nightly",
-        )
-
-    def test_parent_title_is_resolved_to_an_id(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_id.return_value = "99"
-        mocked_confluence_client.update_or_create.return_value = PAGE
+    def test_publishes_a_page_and_returns_the_summary(self, hook_cls):
+        hook_cls.return_value.publish.return_value = CONTENT
         operator = ConfluencePageOperator(
             task_id="publish",
             space="SPACE",
             title="Report",
             body="<p>hi</p>",
             parent_title="Parent",
+            if_exists="skip",
+            version_comment="Nightly",
+            confluence_conn_id="my_conn",
         )
 
-        operator.execute(context={})
-
-        mocked_confluence_client.get_page_id.assert_called_once_with(space="SPACE", title="Parent")
-        assert mocked_confluence_client.update_or_create.call_args.kwargs["parent_id"] == "99"
-
-    def test_unresolvable_parent_title_raises(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_id.return_value = None
-        operator = ConfluencePageOperator(
-            task_id="publish",
-            space="SPACE",
-            title="Report",
-            body="<p>hi</p>",
-            parent_title="Missing",
-        )
-
-        with pytest.raises(ValueError, match="'Missing' was not found in space 'SPACE'"):
-            operator.execute(context={})
-
-    def test_parent_id_and_parent_title_are_mutually_exclusive(self, mocked_confluence_client):
-        operator = ConfluencePageOperator(
-            task_id="publish",
-            space="SPACE",
-            title="Report",
-            body="<p>hi</p>",
-            parent_id="42",
+        assert operator.execute(context={}) == CONTENT
+        hook_cls.assert_called_once_with(confluence_conn_id="my_conn")
+        hook_cls.return_value.publish.assert_called_once_with(
+            "SPACE",
+            "Report",
+            "<p>hi</p>",
+            content_type="page",
+            parent_id=None,
             parent_title="Parent",
+            if_exists="skip",
+            version_comment="Nightly",
         )
 
-        with pytest.raises(ValueError, match="at most one of `parent_id` and `parent_title`"):
-            operator.execute(context={})
-
-    def test_body_and_title_are_templated(self):
-        assert {"title", "body", "parent_id", "parent_title", "confluence_conn_id"} <= set(
-            ConfluencePageOperator.template_fields
+    def test_content_fields_are_templated(self, hook_cls):
+        operator = ConfluencePageOperator(
+            task_id="publish",
+            space="{{ space }}",
+            title="Report {{ ds }}",
+            body="<p>{{ ds }}</p>",
+            parent_title="Parent {{ ds }}",
         )
 
+        operator.render_template_fields({"space": "DOCS", "ds": "2026-01-01"})
 
+        assert (operator.space, operator.title, operator.body, operator.parent_title) == (
+            "DOCS",
+            "Report 2026-01-01",
+            "<p>2026-01-01</p>",
+            "Parent 2026-01-01",
+        )
+
+    def test_if_exists_defaults_to_update(self, hook_cls):
+        hook_cls.return_value.publish.return_value = CONTENT
+
+        ConfluencePageOperator(task_id="publish", space="SPACE", title="Report", body="").execute(context={})
+
+        assert hook_cls.return_value.publish.call_args.kwargs["if_exists"] == "update"
+
+    def test_invalid_if_exists_is_rejected_at_construction(self, hook_cls):
+        with pytest.raises(ValueError, match="`if_exists` must be one of"):
+            ConfluencePageOperator(task_id="publish", space="S", title="T", body="", if_exists="replace")
+
+        hook_cls.assert_not_called()
+
+
+@mock.patch(f"{OPERATORS}.ConfluenceHook", autospec=True)
 class TestConfluenceBlogPostOperator:
-    def test_creates_a_blog_post_when_absent(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_by_title.return_value = None
-        mocked_confluence_client.create_page.return_value = PAGE
+    def test_publishes_a_blog_post_and_returns_the_summary(self, hook_cls):
+        post = ConfluenceContent(**{**CONTENT, "type": "blogpost"})
+        hook_cls.return_value.publish.return_value = post
         operator = ConfluenceBlogPostOperator(
-            task_id="publish", space="SPACE", title="News", body="<p>hi</p>"
+            task_id="publish",
+            space="SPACE",
+            title="Notes",
+            body="<p>hi</p>",
+            if_exists="fail",
+            version_comment="Nightly",
         )
 
-        assert operator.execute(context={}) == PAGE
-        assert mocked_confluence_client.create_page.call_args.kwargs["type"] == "blogpost"
-
-    def test_updates_a_blog_post_when_present(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_by_title.return_value = {"id": "9"}
-        mocked_confluence_client.update_page.return_value = PAGE
-        operator = ConfluenceBlogPostOperator(
-            task_id="publish", space="SPACE", title="News", body="<p>hi</p>"
+        assert operator.execute(context={}) == post
+        hook_cls.assert_called_once_with(confluence_conn_id=ConfluenceHook.default_conn_name)
+        hook_cls.return_value.publish.assert_called_once_with(
+            "SPACE",
+            "Notes",
+            "<p>hi</p>",
+            content_type="blogpost",
+            if_exists="fail",
+            version_comment="Nightly",
         )
 
-        assert operator.execute(context={}) == PAGE
-        assert mocked_confluence_client.update_page.call_args.kwargs["page_id"] == "9"
-        mocked_confluence_client.create_page.assert_not_called()
+    def test_content_fields_are_templated(self, hook_cls):
+        operator = ConfluenceBlogPostOperator(
+            task_id="publish", space="{{ space }}", title="Notes {{ ds }}", body="<p>{{ ds }}</p>"
+        )
 
-    def test_body_and_title_are_templated(self):
-        assert {"title", "body", "confluence_conn_id"} <= set(ConfluenceBlogPostOperator.template_fields)
+        operator.render_template_fields({"space": "DOCS", "ds": "2026-01-01"})
+
+        assert (operator.space, operator.title, operator.body) == (
+            "DOCS",
+            "Notes 2026-01-01",
+            "<p>2026-01-01</p>",
+        )
+
+    def test_invalid_if_exists_is_rejected_at_construction(self, hook_cls):
+        with pytest.raises(ValueError, match="`if_exists` must be one of"):
+            ConfluenceBlogPostOperator(task_id="publish", space="S", title="T", body="", if_exists="replace")

@@ -23,3 +23,15 @@ class ConfluenceError(Exception):
 
 class ConfluenceConnectionError(ConfluenceError):
     """Raised when an Airflow Connection cannot be used to build a Confluence client."""
+
+
+class ConfluenceContentExistsError(ConfluenceError):
+    """Raised by ``publish(..., if_exists="fail")`` when content with the same title already exists."""
+
+
+class ConfluenceContentNotFoundError(ConfluenceError):
+    """Raised when content that an operation depends on, such as a parent page, does not exist."""
+
+
+class ConfluenceSpaceNotFoundError(ConfluenceError):
+    """Raised when a space key does not resolve to a space on Confluence Cloud."""

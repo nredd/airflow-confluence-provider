@@ -20,74 +20,75 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
+from atlassian import ConfluenceServer
 
-from airflow.models import Connection
-from airflow.providers.atlassian.confluence.sensors.confluence import ConfluencePageSensor
+from airflow.providers.atlassian.confluence.sensors.confluence import (
+    ConfluencePageSensor,
+    ConfluenceSensor,
+)
 
-from tests_common.test_utils.compat import connection_as_json
-
-
-@pytest.fixture(autouse=True)
-def confluence_connection(monkeypatch):
-    monkeypatch.setenv(
-        "AIRFLOW_CONN_CONFLUENCE_DEFAULT",
-        connection_as_json(
-            Connection(
-                conn_id="confluence_default",
-                conn_type="confluence",
-                host="https://localhost/confluence/",
-                login="user",
-                password="password",
-            )
-        ),
-    )
+SENSORS = "airflow.providers.atlassian.confluence.sensors.confluence"
 
 
-@pytest.fixture
-def mocked_confluence_client():
-    with mock.patch("airflow.providers.atlassian.confluence.hooks.confluence.Confluence", autospec=True) as m:
-        client = mock.Mock(name="confluence_client")
-        m.return_value = client
-        yield client
-
-
-class TestConfluencePageSensor:
-    def test_raw_response_decides_the_outcome(self, mocked_confluence_client):
-        mocked_confluence_client.page_exists.return_value = True
-        sensor = ConfluencePageSensor(
+@mock.patch(f"{SENSORS}.ConfluenceHook", autospec=True)
+class TestConfluenceSensor:
+    @pytest.mark.parametrize("result", [True, False])
+    def test_raw_response_decides_the_outcome(self, hook_cls, result):
+        client = mock.create_autospec(ConfluenceServer, instance=True)
+        client.page_exists.return_value = result
+        hook_cls.return_value.get_conn.return_value = client
+        sensor = ConfluenceSensor(
             task_id="wait",
             method_name="page_exists",
-            method_params={"space": "SPACE", "title": "Report"},
+            method_params={"space_key": "SPACE", "title": "Report"},
+            confluence_conn_id="my_conn",
         )
 
-        assert sensor.poke(context={}) is True
-        mocked_confluence_client.page_exists.assert_called_once_with(space="SPACE", title="Report")
+        assert sensor.poke(context={}) is result
+        hook_cls.assert_called_once_with(confluence_conn_id="my_conn")
+        client.page_exists.assert_called_once_with(space_key="SPACE", title="Report")
 
-    def test_missing_page_keeps_poking(self, mocked_confluence_client):
-        mocked_confluence_client.page_exists.return_value = False
-        sensor = ConfluencePageSensor(
-            task_id="wait", method_name="page_exists", method_params={"space": "S", "title": "T"}
+    def test_result_processor_receives_context_and_result(self, hook_cls):
+        client = mock.create_autospec(ConfluenceServer, instance=True)
+        client.page_exists.return_value = {"id": "1"}
+        hook_cls.return_value.get_conn.return_value = client
+        processor = mock.Mock(return_value=False)
+        sensor = ConfluenceSensor(
+            task_id="wait",
+            method_name="page_exists",
+            method_params={"space_key": "SPACE", "title": "Report"},
+            result_processor=processor,
         )
+        context = {"ds": "2026-01-01"}
 
-        assert sensor.poke(context={}) is False
+        assert sensor.poke(context=context) is False
+        processor.assert_called_once_with(context, {"id": "1"})
+        client.page_exists.assert_called_once_with(space_key="SPACE", title="Report")
 
-    def test_method_params_default_to_empty(self, mocked_confluence_client):
-        sensor = ConfluencePageSensor(task_id="wait", method_name="get_all_spaces")
 
-        sensor.poke(context={})
-
-        mocked_confluence_client.get_all_spaces.assert_called_once_with()
-
-    def test_result_processor_decides_the_outcome(self, mocked_confluence_client):
-        mocked_confluence_client.get_page_by_id.return_value = {"version": {"number": 4}}
+@mock.patch(f"{SENSORS}.ConfluenceHook", autospec=True)
+class TestConfluencePageSensor:
+    @pytest.mark.parametrize(("found", "expected"), [({"id": "10"}, True), (None, False)])
+    @pytest.mark.parametrize("content_type", ["page", "blogpost"])
+    def test_succeeds_when_the_content_exists(self, hook_cls, content_type, found, expected):
+        hook_cls.return_value.find_content.return_value = found
         sensor = ConfluencePageSensor(
             task_id="wait",
-            method_name="get_page_by_id",
-            method_params={"page_id": "123"},
-            result_processor=lambda result: result["version"]["number"] >= 3,
+            space="SPACE",
+            title="Report",
+            content_type=content_type,
+            confluence_conn_id="my_conn",
         )
 
-        assert sensor.poke(context={}) is True
+        assert sensor.poke(context={}) is expected
+        hook_cls.assert_called_once_with(confluence_conn_id="my_conn")
+        hook_cls.return_value.find_content.assert_called_once_with(
+            "SPACE", "Report", content_type=content_type
+        )
 
-    def test_method_params_are_templated(self):
-        assert {"method_params", "confluence_conn_id"} <= set(ConfluencePageSensor.template_fields)
+    def test_space_and_title_are_templated(self, hook_cls):
+        sensor = ConfluencePageSensor(task_id="wait", space="{{ space }}", title="Report {{ ds }}")
+
+        sensor.render_template_fields({"space": "DOCS", "ds": "2026-01-01"})
+
+        assert (sensor.space, sensor.title) == ("DOCS", "Report 2026-01-01")

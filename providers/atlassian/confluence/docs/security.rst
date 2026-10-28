@@ -16,3 +16,25 @@
     under the License.
 
 .. include:: /../../../../devel-common/src/sphinx_exts/includes/security.rst
+
+Untrusted values in page bodies
+-------------------------------
+
+``ConfluencePageOperator`` and ``ConfluenceBlogPostOperator`` publish ``body`` as Confluence
+storage format, an XHTML dialect that can contain macros. Several of them, such as ``include``
+and ``html``, can pull in other pages or render arbitrary markup. Jinja does not escape
+templated values, so interpolating untrusted text into ``body`` lets whoever controls that text
+inject markup into the page.
+
+Build the body with the helpers in
+:mod:`airflow.providers.atlassian.confluence.utils.storage_format`, which escape every value
+they receive, or escape values yourself with the Jinja ``e`` filter:
+
+.. code-block:: python
+
+    ConfluencePageOperator(
+        task_id="publish",
+        space="AIRFLOW",
+        title="Report {{ ds }}",
+        body="<p>Triggered by {{ dag_run.conf.get('requester', 'unknown') | e }}</p>",
+    )

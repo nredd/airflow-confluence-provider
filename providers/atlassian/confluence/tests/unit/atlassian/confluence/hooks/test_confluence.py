@@ -17,708 +17,667 @@
 # under the License.
 from __future__ import annotations
 
+import sys
+import warnings
+from dataclasses import dataclass
+from typing import Any
 from unittest import mock
 
 import pytest
+from atlassian import ConfluenceServer, ConfluenceV2
 
 from airflow.models import Connection
-from airflow.providers.atlassian.confluence.exceptions import ConfluenceConnectionError
+from airflow.providers.atlassian.confluence.exceptions import (
+    ConfluenceConnectionError,
+    ConfluenceContentExistsError,
+    ConfluenceContentNotFoundError,
+    ConfluenceSpaceNotFoundError,
+)
+from airflow.providers.atlassian.confluence.get_provider_info import get_provider_info
 from airflow.providers.atlassian.confluence.hooks.confluence import ConfluenceHook
 
-from tests_common.test_utils.compat import connection_as_json
-
+HOOK_MODULE = "airflow.providers.atlassian.confluence.hooks.confluence"
 CONN_ID = "confluence_default"
+DC_URL = "https://confluence.example.com/confluence"
+CLOUD_URL = "https://example.atlassian.net/wiki"
+BODY = "<p>hello</p>"
 
 
-def set_connection(monkeypatch, **kwargs):
-    """Register ``confluence_default`` in the environment, overriding the defaults given."""
-    fields: dict = {
-        "conn_id": CONN_ID,
-        "conn_type": "confluence",
-        "host": "https://localhost/confluence/",
-        "login": "user",
-        "password": "password",
-    }
-    fields.update(kwargs)
-    monkeypatch.setenv(f"AIRFLOW_CONN_{CONN_ID}".upper(), connection_as_json(Connection(**fields)))
+@dataclass
+class Sdk:
+    """The two SDK client constructors, patched in the hook module, with spec'd instances."""
+
+    server_ctor: mock.Mock
+    cloud_ctor: mock.Mock
+
+    @property
+    def server(self) -> mock.Mock:
+        return self.server_ctor.return_value
+
+    @property
+    def cloud(self) -> mock.Mock:
+        return self.cloud_ctor.return_value
 
 
 @pytest.fixture
-def mocked_confluence_client():
-    with mock.patch("airflow.providers.atlassian.confluence.hooks.confluence.Confluence", autospec=True) as m:
-        m.return_value = mock.Mock(name="confluence_client")
-        yield m
+def sdk(monkeypatch) -> Sdk:
+    server_ctor = mock.create_autospec(ConfluenceServer)
+    cloud_ctor = mock.create_autospec(ConfluenceV2)
+    monkeypatch.setattr(f"{HOOK_MODULE}.ConfluenceServer", server_ctor)
+    monkeypatch.setattr(f"{HOOK_MODULE}.ConfluenceV2", cloud_ctor)
+    return Sdk(server_ctor, cloud_ctor)
 
 
 @pytest.fixture
-def hook(monkeypatch, mocked_confluence_client):
-    set_connection(monkeypatch)
-    return ConfluenceHook()
+def set_connection(create_connection_without_db):
+    def _set_connection(**kwargs: Any) -> None:
+        fields: dict[str, Any] = {
+            "conn_id": CONN_ID,
+            "conn_type": "confluence",
+            "host": DC_URL,
+            "login": "user",
+            "password": "password",
+        }
+        fields.update(kwargs)
+        create_connection_without_db(Connection(**fields))
+
+    return _set_connection
 
 
-class TestConfluenceHookConnection:
-    def test_client_is_not_created_until_first_use(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch)
+class TestConnection:
+    def test_nothing_is_created_on_init(self, sdk, set_connection):
+        set_connection()
 
-        confluence_hook = ConfluenceHook()
+        ConfluenceHook()
 
-        assert confluence_hook.client is None
-        mocked_confluence_client.assert_not_called()
+        sdk.server_ctor.assert_not_called()
+        sdk.cloud_ctor.assert_not_called()
 
-    def test_basic_auth_is_used_without_a_token(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch, extra='{"verify": false}')
+    def test_data_center_basic_auth(self, sdk, set_connection):
+        set_connection(extra={"verify": False})
+        proxies = {"https": "https://proxy.example"}
 
-        ConfluenceHook(proxies={"https": "https://proxy.example"}).get_conn()
+        client = ConfluenceHook(proxies=proxies).get_conn()
 
-        mocked_confluence_client.assert_called_once_with(
-            url="https://localhost/confluence/",
-            verify_ssl=False,
-            proxies={"https": "https://proxy.example"},
-            api_version="latest",
-            api_root="rest/api",
-            username="user",
-            password="password",
+        assert client is sdk.server
+        sdk.server_ctor.assert_called_once_with(
+            url=DC_URL, username="user", password="password", verify_ssl=False, proxies=proxies
         )
+        sdk.cloud_ctor.assert_not_called()
 
-    def test_token_takes_precedence_over_login_and_password(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch, extra='{"token": "s3cr3t", "cloud": true}')
-
-        ConfluenceHook().get_conn()
-
-        _, kwargs = mocked_confluence_client.call_args
-        assert kwargs["token"] == "s3cr3t"
-        assert kwargs["cloud"] is True
-        assert "username" not in kwargs
-        assert "password" not in kwargs
-
-    def test_verify_defaults_to_true_without_extras(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch)
+    def test_data_center_token_replaces_login_and_password(self, sdk, set_connection):
+        set_connection(extra={"token": "s3cr3t"})
 
         ConfluenceHook().get_conn()
 
-        _, kwargs = mocked_confluence_client.call_args
-        assert kwargs["verify_ssl"] is True
+        sdk.server_ctor.assert_called_once_with(url=DC_URL, token="s3cr3t", verify_ssl=True, proxies=None)
 
-    def test_cloud_is_omitted_when_unset_so_the_sdk_can_auto_detect(
-        self, monkeypatch, mocked_confluence_client
+    def test_cloud_uses_basic_auth_with_the_v2_client(self, sdk, set_connection):
+        set_connection(host=CLOUD_URL, login="me@example.com", password="api-token")
+
+        client = ConfluenceHook().get_conn()
+
+        assert client is sdk.cloud
+        sdk.cloud_ctor.assert_called_once_with(
+            url=CLOUD_URL, username="me@example.com", password="api-token", verify_ssl=True, proxies=None
+        )
+        sdk.server_ctor.assert_not_called()
+
+    def test_cloud_client_deprecation_warning_is_silenced(self, sdk, set_connection):
+        set_connection(host=CLOUD_URL)
+        sdk.cloud_ctor.side_effect = lambda **_: warnings.warn("legacy", DeprecationWarning, stacklevel=1)
+
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            ConfluenceHook().get_conn()
+
+        assert recorded == []
+
+    def test_client_is_created_once(self, sdk, set_connection):
+        set_connection()
+        hook = ConfluenceHook()
+
+        assert hook.get_conn() is hook.get_conn()
+        sdk.server_ctor.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("host", "extra", "expected"),
+        [
+            ("https://example.atlassian.net/wiki", None, True),
+            ("example.atlassian.net", None, True),
+            ("https://example.jira.com/wiki", None, True),
+            ("https://api.atlassian.com/ex/confluence/abc", None, True),
+            ("https://confluence.example.com/confluence", None, False),
+            ("https://evilatlassian.net/wiki", None, False),
+            ("https://wiki.example.com", {"deployment": "cloud"}, True),
+            ("https://example.atlassian.net", {"deployment": "data_center"}, False),
+            ("https://example.atlassian.net/wiki", {"deployment": "auto"}, True),
+            ("https://wiki.example.com", {"deployment": "auto"}, False),
+        ],
+    )
+    def test_is_cloud(self, sdk, set_connection, host, extra, expected):
+        set_connection(host=host, extra=extra)
+
+        hook = ConfluenceHook()
+
+        assert hook.is_cloud is expected
+        sdk.server_ctor.assert_not_called()
+        sdk.cloud_ctor.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("host", "port", "schema", "expected"),
+        [
+            ("confluence.example.com", None, None, "https://confluence.example.com"),
+            ("http://confluence.example.com", None, None, "http://confluence.example.com"),
+            ("confluence.example.com/confluence/", None, None, "https://confluence.example.com/confluence"),
+            ("confluence.example.com", 8443, None, "https://confluence.example.com:8443"),
+            ("http://confluence.example.com/wiki", 8090, None, "http://confluence.example.com:8090/wiki"),
+            (
+                "https://confluence.example.com:9443/wiki",
+                8443,
+                None,
+                "https://confluence.example.com:9443/wiki",
+            ),
+            ("https://[::1]/wiki", 8443, None, "https://[::1]:8443/wiki"),
+            ("https://[::1]:9443/wiki", 8443, None, "https://[::1]:9443/wiki"),
+            ("[::1]", None, None, "https://[::1]"),
+            ("confluence.example.com", None, "wiki", "https://confluence.example.com"),
+        ],
+    )
+    def test_url_is_built_from_host_and_port_and_schema_is_ignored(
+        self, sdk, set_connection, host, port, schema, expected
     ):
-        set_connection(monkeypatch)
+        set_connection(host=host, port=port, schema=schema)
 
         ConfluenceHook().get_conn()
 
-        _, kwargs = mocked_confluence_client.call_args
-        assert "cloud" not in kwargs
+        assert sdk.server_ctor.call_args.kwargs["url"] == expected
 
-    def test_cloud_false_is_still_forwarded_when_set_explicitly(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch, extra='{"cloud": false}')
+    @pytest.mark.parametrize(
+        ("fields", "message"),
+        [
+            ({"host": None}, "host is required"),
+            ({"extra": {"deployment": "server"}}, "`deployment` extra must be one of"),
+            ({"extra": {"verify": "maybe"}}, "`verify` extra must be true or false"),
+            ({"extra": {"verify": 1}}, "`verify` extra must be true or false"),
+            ({"host": "https://confluence.example.com:notaport"}, "invalid port"),
+            ({"login": None, "password": None}, "requires either the `token` extra or both"),
+            ({"password": None}, "requires either the `token` extra or both"),
+            ({"host": CLOUD_URL, "extra": {"token": "pat"}}, "put the account email in Login"),
+            ({"host": CLOUD_URL, "password": None}, "requires both Login"),
+            (
+                {"host": "https://wiki.example.com", "extra": {"deployment": "cloud", "token": "pat"}},
+                "put the account email in Login",
+            ),
+        ],
+    )
+    def test_invalid_connections_are_rejected(self, sdk, set_connection, fields, message):
+        set_connection(**fields)
 
-        ConfluenceHook().get_conn()
+        with pytest.raises(ConfluenceConnectionError, match=message):
+            ConfluenceHook().get_conn()
 
-        _, kwargs = mocked_confluence_client.call_args
-        assert kwargs["cloud"] is False
-
-    def test_client_is_created_once_and_reused(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch)
-        confluence_hook = ConfluenceHook()
-
-        first = confluence_hook.get_conn()
-        second = confluence_hook.get_conn()
-
-        assert first is second
-        mocked_confluence_client.assert_called_once()
-
-    def test_missing_conn_id_raises(self):
+    def test_conn_id_is_required(self, sdk):
         with pytest.raises(ConfluenceConnectionError, match="confluence_conn_id is required"):
             ConfluenceHook(confluence_conn_id="").get_conn()
 
-    def test_missing_host_raises(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch, host=None)
-
-        with pytest.raises(ConfluenceConnectionError, match="host is required"):
-            ConfluenceHook().get_conn()
-
     @pytest.mark.parametrize(
-        ("login", "password"),
+        ("verify", "expected"),
         [
-            pytest.param(None, "password", id="no-login"),
-            pytest.param("user", None, id="no-password"),
-            pytest.param(None, None, id="neither"),
+            (None, True),
+            (True, True),
+            (False, False),
+            ("true", True),
+            ("TRUE", True),
+            ("false", False),
+            ("False", False),
         ],
     )
-    def test_missing_credentials_without_a_token_raises(
-        self, monkeypatch, mocked_confluence_client, login, password
-    ):
-        set_connection(monkeypatch, login=login, password=password)
-
-        with pytest.raises(ConfluenceConnectionError, match="login and password are required"):
-            ConfluenceHook().get_conn()
-
-    def test_token_alone_is_enough(self, monkeypatch, mocked_confluence_client):
-        set_connection(monkeypatch, login=None, password=None, extra='{"token": "s3cr3t"}')
+    def test_verify_is_coerced_to_bool(self, sdk, set_connection, verify, expected):
+        set_connection(extra={"verify": verify})
 
         ConfluenceHook().get_conn()
 
-        mocked_confluence_client.assert_called_once()
-
-    @pytest.mark.parametrize(
-        ("host", "schema", "port", "expected"),
-        [
-            pytest.param(
-                "confluence.example.com", None, None, "https://confluence.example.com", id="bare-host"
-            ),
-            pytest.param(
-                "http://confluence.example.com",
-                None,
-                None,
-                "http://confluence.example.com",
-                id="scheme-in-host",
-            ),
-            pytest.param(
-                "confluence.example.com", "http", None, "http://confluence.example.com", id="schema-field"
-            ),
-            pytest.param(
-                "confluence.example.com",
-                None,
-                8443,
-                "https://confluence.example.com:8443",
-                id="port-injected",
-            ),
-            pytest.param(
-                "https://confluence.example.com:9000",
-                None,
-                8443,
-                "https://confluence.example.com:9000",
-                id="port-in-host-wins",
-            ),
-            pytest.param(
-                "https://user@confluence.example.com",
-                None,
-                8443,
-                "https://user@confluence.example.com:8443",
-                id="userinfo-not-mistaken-for-port",
-            ),
-            pytest.param(
-                "confluence.example.com/wiki",
-                None,
-                8443,
-                "https://confluence.example.com:8443/wiki",
-                id="path-preserved",
-            ),
-        ],
-    )
-    def test_connection_url_is_built_from_host_schema_and_port(
-        self, monkeypatch, mocked_confluence_client, host, schema, port, expected
-    ):
-        set_connection(monkeypatch, host=host, schema=schema, port=port)
-
-        ConfluenceHook().get_conn()
-
-        _, kwargs = mocked_confluence_client.call_args
-        assert kwargs["url"] == expected
+        assert sdk.server_ctor.call_args.kwargs["verify_ssl"] is expected
 
 
-class TestConfluenceHookUiFields:
-    def test_connection_form_widgets_match_the_documented_extras(self):
-        pytest.importorskip("flask_babel")
+class TestFormWidgets:
+    def test_widgets_cover_the_connection_extras(self):
+        pytest.importorskip("wtforms")
 
-        assert set(ConfluenceHook.get_connection_form_widgets()) == {"verify", "token", "cloud"}
+        widgets = ConfluenceHook.get_connection_form_widgets()
 
-    def test_only_schema_is_hidden(self):
-        assert ConfluenceHook.get_ui_field_behaviour() == {"hidden_fields": ["schema"]}
-
-
-class TestConfluenceHookPageLookup:
-    def test_find_child_page_by_title_returns_the_matching_id(self, hook):
-        client = hook.get_conn()
-        client.get_page_child_by_type.return_value = [
-            {"id": "1", "title": "Other"},
-            {"id": "2", "title": "Target"},
+        assert set(widgets) == {"deployment", "token", "verify"}
+        assert [value for value, _ in widgets["deployment"].kwargs["choices"]] == [
+            "auto",
+            "cloud",
+            "data_center",
         ]
 
-        assert hook.find_child_page_by_title("100", "Target") == "2"
-
-    def test_find_child_page_by_title_never_caps_pagination(self, hook):
-        client = hook.get_conn()
-        client.get_page_child_by_type.return_value = []
-
-        hook.find_child_page_by_title("100", "Target")
-
-        # Omitting start/limit makes the SDK return a fully paginated generator.
-        client.get_page_child_by_type.assert_called_once_with("100", type="page")
-
-    def test_find_child_page_by_title_returns_none_when_absent(self, hook):
-        client = hook.get_conn()
-        client.get_page_child_by_type.return_value = [{"id": "1", "title": "Other"}]
-
-        assert hook.find_child_page_by_title("100", "Target") is None
-
-    def test_find_child_page_by_title_handles_no_children(self, hook):
-        client = hook.get_conn()
-        client.get_page_child_by_type.return_value = None
-
-        assert hook.find_child_page_by_title("100", "Target") is None
-
-    def test_find_child_page_by_title_honours_page_type(self, hook):
-        client = hook.get_conn()
-        client.get_page_child_by_type.return_value = []
-
-        hook.find_child_page_by_title("100", "Target", page_type="blogpost")
-
-        client.get_page_child_by_type.assert_called_once_with("100", type="blogpost")
+    def test_no_widgets_without_wtforms(self):
+        with mock.patch.dict(sys.modules, {"wtforms": None}):
+            assert ConfluenceHook.get_connection_form_widgets() == {}
 
 
-class TestConfluenceHookGetOrCreatePage:
-    def test_delegates_to_the_sdk_upsert_when_a_parent_is_given(self, hook):
-        client = hook.get_conn()
+class TestProviderMetadata:
+    """The hook's legacy form hooks must stay in sync with the ``conn-fields`` in provider.yaml."""
 
-        hook.get_or_create_page(title="Report", body="<p>hi</p>", parent_id="42")
+    @staticmethod
+    def get_connection_type() -> dict[str, Any]:
+        (connection_type,) = get_provider_info()["connection-types"]
+        return connection_type
 
-        client.update_or_create.assert_called_once_with(
-            parent_id="42",
-            title="Report",
-            body="<p>hi</p>",
-            representation="storage",
-            minor_edit=False,
-            version_comment=None,
+    def test_ui_field_behaviour_matches_provider_yaml(self):
+        yaml_behaviour = self.get_connection_type()["ui-field-behaviour"]
+
+        assert ConfluenceHook.get_ui_field_behaviour() == {
+            key.replace("-", "_"): value for key, value in yaml_behaviour.items()
+        }
+
+    def test_widgets_match_provider_yaml_conn_fields(self):
+        pytest.importorskip("wtforms")
+
+        assert set(ConfluenceHook.get_connection_form_widgets()) == set(
+            self.get_connection_type()["conn-fields"]
         )
 
-    def test_creates_a_top_level_page_when_the_title_is_free(self, hook):
-        client = hook.get_conn()
-        client.get_page_by_title.return_value = None
 
-        hook.get_or_create_page(space="SPACE", title="Report", body="<p>hi</p>")
+class TestTestConnection:
+    @pytest.mark.parametrize("host", [DC_URL, CLOUD_URL])
+    def test_authenticated_user_succeeds(self, sdk, set_connection, host):
+        set_connection(host=host)
+        client = sdk.cloud if host == CLOUD_URL else sdk.server
+        client.get.return_value = {"type": "known", "username": "user"}
 
-        client.create_page.assert_called_once_with(
-            space="SPACE",
-            title="Report",
-            body="<p>hi</p>",
-            parent_id=None,
-            representation="storage",
-            editor=None,
-            full_width=False,
-            status="current",
-        )
-        client.update_page.assert_not_called()
+        assert ConfluenceHook().test_connection() == (True, "Connection successfully tested")
+        client.get.assert_called_once_with("rest/api/user/current")
 
-    def test_updates_an_existing_top_level_page(self, hook):
-        client = hook.get_conn()
-        client.get_page_by_title.return_value = {"id": "7"}
+    def test_anonymous_user_fails(self, sdk, set_connection):
+        set_connection()
+        sdk.server.get.return_value = {"type": "anonymous"}
 
-        hook.get_or_create_page(space="SPACE", title="Report", body="<p>hi</p>", version_comment="nightly")
+        success, message = ConfluenceHook().test_connection()
 
-        client.update_page.assert_called_once_with(
-            page_id="7",
-            title="Report",
-            body="<p>hi</p>",
-            parent_id=None,
-            representation="storage",
-            minor_edit=False,
-            version_comment="nightly",
-            always_update=False,
-            full_width=False,
-        )
-        client.create_page.assert_not_called()
+        assert not success
+        assert "anonymous" in message
 
-    def test_top_level_page_requires_a_space(self, hook):
-        with pytest.raises(ValueError, match="`space` is required"):
-            hook.get_or_create_page(title="Report", body="<p>hi</p>")
+    def test_request_errors_are_reported(self, sdk, set_connection):
+        set_connection()
+        sdk.server.get.side_effect = ConnectionError("boom")
+
+        assert ConfluenceHook().test_connection() == (False, "boom")
+
+    def test_connection_errors_are_reported(self, sdk, set_connection):
+        set_connection(login=None)
+
+        success, message = ConfluenceHook().test_connection()
+
+        assert not success
+        assert "requires either the `token` extra" in message
 
 
-class TestConfluenceHookBlogPosts:
-    def test_create_blog_post_sets_the_blogpost_type(self, hook):
-        client = hook.get_conn()
+@dataclass
+class Deployment:
+    """One deployment under test: its hook, spec'd client and the shapes of its responses."""
 
-        hook.create_blog_post(space="SPACE", title="News", body="<p>hi</p>")
+    name: str
+    hook: ConfluenceHook
+    client: mock.Mock
+    base_url: str
 
-        client.create_page.assert_called_once_with(
-            space="SPACE",
-            title="News",
-            body="<p>hi</p>",
-            type="blogpost",
-            representation="storage",
-            status="current",
-        )
+    @property
+    def is_cloud(self) -> bool:
+        return self.name == "cloud"
 
-    def test_update_blog_post_sets_the_blogpost_type(self, hook):
-        client = hook.get_conn()
+    def item(self, content_id: str = "10", title: str = "Report", version: int = 3) -> dict[str, Any]:
+        return {
+            "id": content_id,
+            "title": title,
+            "version": {"number": version},
+            "_links": {"webui": f"/spaces/SPACE/pages/{content_id}", "base": self.base_url},
+        }
 
-        hook.update_blog_post(page_id="7", title="News", body="<p>hi</p>")
+    def stub_content(self, *items: dict[str, Any]) -> None:
+        """Make the client find the given items by title, and know the space ``SPACE``."""
+        by_title = {item["title"]: item for item in items}
 
-        client.update_page.assert_called_once_with(
-            page_id="7",
-            title="News",
-            body="<p>hi</p>",
-            type="blogpost",
-            representation="storage",
-            minor_edit=False,
-            version_comment=None,
-        )
+        def _get(path: str, params: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
+            if path == "api/v2/spaces":
+                return {"results": [{"id": "99", "key": "SPACE"}]}
+            params = params or {}
+            title = params.get("title")
+            if "cql" in params:
+                quoted = params["cql"].rsplit("title = ", 1)[1]
+                title = quoted[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+            found = by_title.get(title) if title else None
+            return {"results": [found] if found else [], "_links": {"base": self.base_url}}
 
-    def test_get_blog_post_by_title_filters_by_type(self, hook):
-        client = hook.get_conn()
+        self.client.get.side_effect = _get
 
-        hook.get_blog_post_by_title(space="SPACE", title="News")
-
-        client.get_page_by_title.assert_called_once_with(
-            space="SPACE", title="News", expand=None, type="blogpost"
-        )
-
-    def test_get_or_create_blog_post_creates_when_absent(self, hook):
-        client = hook.get_conn()
-        client.get_page_by_title.return_value = None
-
-        hook.get_or_create_blog_post(space="SPACE", title="News", body="<p>hi</p>")
-
-        client.create_page.assert_called_once()
-        client.update_page.assert_not_called()
-
-    def test_get_or_create_blog_post_updates_when_present(self, hook):
-        client = hook.get_conn()
-        client.get_page_by_title.return_value = {"id": "9"}
-
-        hook.get_or_create_blog_post(space="SPACE", title="News", body="<p>hi</p>")
-
-        assert client.update_page.call_args.kwargs["page_id"] == "9"
-        client.create_page.assert_not_called()
+    def content_calls(self) -> list[Any]:
+        """The ``get`` calls that look content up, leaving out the Cloud space-ID lookup."""
+        return [call for call in self.client.get.call_args_list if call.args[0] != "api/v2/spaces"]
 
 
-class TestConfluenceHookV2Content:
-    @pytest.mark.parametrize(
-        ("method", "path"),
-        [
-            pytest.param("create_folder", "/api/v2/folders", id="folder"),
-            pytest.param("create_database", "/api/v2/databases", id="database"),
-        ],
-    )
-    def test_create_posts_the_v2_payload(self, hook, method, path):
-        client = hook.get_conn()
+@pytest.fixture(params=["data_center", "cloud"])
+def deployment(request, sdk, set_connection) -> Deployment:
+    if request.param == "cloud":
+        set_connection(host=CLOUD_URL)
+        return Deployment("cloud", ConfluenceHook(), sdk.cloud, CLOUD_URL)
+    set_connection()
+    return Deployment("data_center", ConfluenceHook(), sdk.server, DC_URL)
 
-        getattr(hook, method)(space_id="99", title="Docs", parent_id="42")
 
-        client.post.assert_called_once_with(path, data={"spaceId": "99", "title": "Docs", "parentId": "42"})
+def _find_params(deployment: Deployment, title: str) -> dict[str, Any]:
+    if deployment.is_cloud:
+        return {"space-id": "99", "title": title, "status": "current", "limit": 1}
+    return {
+        "spaceKey": "SPACE",
+        "title": title,
+        "type": "page",
+        "expand": "version,space",
+        "limit": 1,
+    }
 
-    @pytest.mark.parametrize(
-        ("method", "path"),
-        [
-            pytest.param("create_folder", "/api/v2/folders", id="folder"),
-            pytest.param("create_database", "/api/v2/databases", id="database"),
-        ],
-    )
-    def test_create_omits_the_parent_when_not_given(self, hook, method, path):
-        client = hook.get_conn()
 
-        getattr(hook, method)(space_id="99", title="Docs")
+def _collection(deployment: Deployment, content_type: str = "page") -> str:
+    if deployment.is_cloud:
+        return "api/v2/pages" if content_type == "page" else "api/v2/blogposts"
+    return "rest/api/content"
 
-        client.post.assert_called_once_with(path, data={"spaceId": "99", "title": "Docs"})
 
-    @pytest.mark.parametrize(
-        ("method", "path"),
-        [
-            pytest.param("get_folder", "/api/v2/folders/5", id="folder"),
-            pytest.param("get_database", "/api/v2/databases/5", id="database"),
-        ],
-    )
-    def test_get_uses_the_v2_path(self, hook, method, path):
-        client = hook.get_conn()
+class TestFindContent:
+    def test_request_and_summary(self, deployment):
+        deployment.stub_content(deployment.item())
 
-        getattr(hook, method)("5")
+        content = deployment.hook.find_content("SPACE", "Report")
 
-        client.get.assert_called_once_with(path)
+        assert deployment.content_calls() == [
+            mock.call(_collection(deployment), params=_find_params(deployment, "Report"))
+        ]
+        assert content == {
+            "id": "10",
+            "type": "page",
+            "title": "Report",
+            "space": "SPACE",
+            "version": 3,
+            "url": f"{deployment.base_url}/spaces/SPACE/pages/10",
+            "action": "skipped",
+        }
+
+    def test_blogpost_lookup(self, deployment):
+        title = 'Say "hi" \\o/'
+        deployment.stub_content(deployment.item(title=title))
+
+        content = deployment.hook.find_content("SPACE", title, content_type="blogpost")
+
+        (call,) = deployment.content_calls()
+        if deployment.is_cloud:
+            assert call.args == ("api/v2/blogposts",)
+            assert call.kwargs["params"]["title"] == title
+        else:
+            # Data Center's title lookup needs ``postingDay`` for blog posts, so it goes through CQL.
+            assert call == mock.call(
+                "rest/api/content/search",
+                params={
+                    "cql": 'space = "SPACE" and type = blogpost and title = "Say \\"hi\\" \\\\o/"',
+                    "expand": "version,space",
+                    "limit": 1,
+                },
+            )
+        assert content is not None
+        assert content["type"] == "blogpost"
+
+    def test_missing_content_returns_none(self, deployment):
+        deployment.stub_content()
+
+        assert deployment.hook.find_content("SPACE", "Nope") is None
 
     @pytest.mark.parametrize(
-        ("method", "path"),
+        ("links", "list_base", "expected"),
         [
-            pytest.param("delete_folder", "/api/v2/folders/5", id="folder"),
-            pytest.param("delete_database", "/api/v2/databases/5", id="database"),
+            (
+                {"webui": "/p/1", "base": "https://item.example"},
+                "https://list.example",
+                "https://item.example/p/1",
+            ),
+            ({"webui": "/p/1"}, "https://list.example", "https://list.example/p/1"),
+            ({"webui": "/p/1"}, None, None),
+            ({"base": "https://item.example"}, None, None),
+            (None, "https://list.example", None),
         ],
     )
-    def test_delete_uses_the_v2_path(self, hook, method, path):
-        client = hook.get_conn()
+    def test_url_is_built_from_base_and_webui(self, deployment, links, list_base, expected):
+        item = {"id": "10", "title": "Report", "version": {"number": 1}}
+        if links is not None:
+            item["_links"] = links
+        response: dict[str, Any] = {"results": [item]}
+        if list_base:
+            response["_links"] = {"base": list_base}
+        deployment.client.get.side_effect = lambda path, params=None, **_: (
+            {"results": [{"id": "99"}]} if path == "api/v2/spaces" else response
+        )
 
-        getattr(hook, method)("5")
+        content = deployment.hook.find_content("SPACE", "Report")
 
-        client.delete.assert_called_once_with(path)
+        assert content is not None
+        assert content["url"] == expected
 
-    def test_create_whiteboard_maps_to_the_sdk_camel_case_kwargs(self, hook):
-        client = hook.get_conn()
+    def test_unknown_space_on_cloud(self, sdk, set_connection):
+        set_connection(host=CLOUD_URL)
+        sdk.cloud.get.return_value = {"results": []}
 
-        hook.create_whiteboard(space_id="99", title="Plan", parent_id="42")
+        with pytest.raises(ConfluenceSpaceNotFoundError, match="'SPACE'"):
+            ConfluenceHook().find_content("SPACE", "Report")
 
-        client.create_whiteboard.assert_called_once_with(spaceId="99", title="Plan", parentId="42")
+        sdk.cloud.get.assert_called_once_with("api/v2/spaces", params={"keys": "SPACE"})
 
-    def test_get_whiteboard_delegates_to_the_sdk(self, hook):
-        client = hook.get_conn()
+    def test_cloud_space_id_is_looked_up_once(self, sdk, set_connection):
+        set_connection(host=CLOUD_URL)
+        deployment = Deployment("cloud", ConfluenceHook(), sdk.cloud, CLOUD_URL)
+        deployment.stub_content()
 
-        hook.get_whiteboard("5")
+        deployment.hook.find_content("SPACE", "One")
+        deployment.hook.find_content("SPACE", "Two")
 
-        client.get_whiteboard.assert_called_once_with("5")
-
-    def test_delete_whiteboard_delegates_to_the_sdk(self, hook):
-        client = hook.get_conn()
-
-        hook.delete_whiteboard("5")
-
-        client.delete_whiteboard.assert_called_once_with("5")
+        spaces_calls = [c for c in sdk.cloud.get.call_args_list if c.args[0] == "api/v2/spaces"]
+        assert len(spaces_calls) == 1
 
 
-class TestConfluenceHookPassthroughs:
-    """Each wrapper must forward its arguments to the identically named SDK method."""
+def _create_payload(deployment: Deployment, content_type: str, parent_id: str | None) -> dict[str, Any]:
+    if deployment.is_cloud:
+        payload: dict[str, Any] = {
+            "spaceId": "99",
+            "status": "current",
+            "title": "Report",
+            "body": {"representation": "storage", "value": BODY},
+        }
+        if parent_id:
+            payload["parentId"] = parent_id
+        return payload
+    payload = {
+        "type": content_type,
+        "title": "Report",
+        "space": {"key": "SPACE"},
+        "body": {"storage": {"value": BODY, "representation": "storage"}},
+    }
+    if parent_id:
+        payload["ancestors"] = [{"id": parent_id}]
+    return payload
+
+
+def _update_payload(deployment: Deployment, content_type: str, version_comment: str | None) -> dict[str, Any]:
+    version: dict[str, Any] = {"number": 4}
+    if version_comment:
+        version["message"] = version_comment
+    if deployment.is_cloud:
+        return {
+            "id": "10",
+            "status": "current",
+            "title": "Report",
+            "body": {"representation": "storage", "value": BODY},
+            "version": version,
+        }
+    return {
+        "id": "10",
+        "type": content_type,
+        "title": "Report",
+        "space": {"key": "SPACE"},
+        "body": {"storage": {"value": BODY, "representation": "storage"}},
+        "version": version,
+    }
+
+
+class TestPublish:
+    @pytest.mark.parametrize(
+        ("content_type", "parent_id"), [("page", None), ("page", "77"), ("blogpost", None)]
+    )
+    def test_creates_missing_content(self, deployment, content_type, parent_id):
+        deployment.stub_content()
+        deployment.client.post.return_value = deployment.item(content_id="11", version=1)
+
+        result = deployment.hook.publish(
+            "SPACE", "Report", BODY, content_type=content_type, parent_id=parent_id
+        )
+
+        deployment.client.post.assert_called_once_with(
+            _collection(deployment, content_type), data=_create_payload(deployment, content_type, parent_id)
+        )
+        deployment.client.put.assert_not_called()
+        assert result == {
+            "id": "11",
+            "type": content_type,
+            "title": "Report",
+            "space": "SPACE",
+            "version": 1,
+            "url": f"{deployment.base_url}/spaces/SPACE/pages/11",
+            "action": "created",
+        }
+
+    @pytest.mark.parametrize("content_type", ["page", "blogpost"])
+    @pytest.mark.parametrize("version_comment", [None, "Nightly run"])
+    def test_updates_existing_content_in_place(self, deployment, content_type, version_comment):
+        deployment.stub_content(deployment.item(version=3))
+        deployment.client.put.return_value = deployment.item(version=4)
+
+        result = deployment.hook.publish(
+            "SPACE", "Report", BODY, content_type=content_type, version_comment=version_comment
+        )
+
+        deployment.client.put.assert_called_once_with(
+            f"{_collection(deployment, content_type)}/10",
+            data=_update_payload(deployment, content_type, version_comment),
+        )
+        deployment.client.post.assert_not_called()
+        assert result["action"] == "updated"
+        assert result["version"] == 4
+        assert result["id"] == "10"
+
+    def test_parent_is_ignored_when_updating(self, deployment):
+        deployment.stub_content(deployment.item(), deployment.item(content_id="77", title="Parent"))
+        deployment.client.put.return_value = deployment.item(version=4)
+
+        deployment.hook.publish("SPACE", "Report", BODY, parent_title="Parent")
+
+        deployment.client.put.assert_called_once_with(
+            f"{_collection(deployment)}/10", data=_update_payload(deployment, "page", None)
+        )
+        assert len(deployment.content_calls()) == 1
+
+    def test_skip_returns_existing_content_untouched(self, deployment):
+        deployment.stub_content(deployment.item())
+
+        result = deployment.hook.publish("SPACE", "Report", BODY, if_exists="skip")
+
+        assert result["action"] == "skipped"
+        assert result["id"] == "10"
+        deployment.client.put.assert_not_called()
+        deployment.client.post.assert_not_called()
+
+    def test_fail_raises_when_content_exists(self, deployment):
+        deployment.stub_content(deployment.item())
+
+        with pytest.raises(ConfluenceContentExistsError, match="'Report'"):
+            deployment.hook.publish("SPACE", "Report", BODY, if_exists="fail")
+
+        deployment.client.put.assert_not_called()
+        deployment.client.post.assert_not_called()
+
+    def test_fail_creates_when_content_is_missing(self, deployment):
+        deployment.stub_content()
+        deployment.client.post.return_value = deployment.item(version=1)
+
+        result = deployment.hook.publish("SPACE", "Report", BODY, if_exists="fail")
+
+        assert result["action"] == "created"
+
+    def test_parent_title_is_resolved_within_the_space(self, deployment):
+        deployment.stub_content(deployment.item(content_id="77", title="Parent"))
+        deployment.client.post.return_value = deployment.item(content_id="11", version=1)
+
+        deployment.hook.publish("SPACE", "Report", BODY, parent_title="Parent")
+
+        assert [call.kwargs["params"]["title"] for call in deployment.content_calls()] == ["Report", "Parent"]
+        assert deployment.content_calls()[1].kwargs["params"] == _find_params(deployment, "Parent")
+        deployment.client.post.assert_called_once_with(
+            _collection(deployment), data=_create_payload(deployment, "page", "77")
+        )
+
+    def test_missing_parent_title_raises(self, deployment):
+        deployment.stub_content()
+
+        with pytest.raises(ConfluenceContentNotFoundError, match="'Parent'"):
+            deployment.hook.publish("SPACE", "Report", BODY, parent_title="Parent")
+
+        deployment.client.post.assert_not_called()
 
     @pytest.mark.parametrize(
-        ("hook_method", "sdk_method", "kwargs", "expected"),
+        ("kwargs", "message"),
         [
-            pytest.param(
-                "create_page",
-                "create_page",
-                {"space": "S", "title": "T", "body": "B"},
-                {
-                    "space": "S",
-                    "title": "T",
-                    "body": "B",
-                    "parent_id": None,
-                    "representation": "storage",
-                    "editor": None,
-                    "full_width": False,
-                    "status": "current",
-                },
-                id="create_page",
-            ),
-            pytest.param(
-                "update_page",
-                "update_page",
-                {"page_id": "1", "title": "T", "body": "B"},
-                {
-                    "page_id": "1",
-                    "title": "T",
-                    "body": "B",
-                    "parent_id": None,
-                    "representation": "storage",
-                    "minor_edit": False,
-                    "version_comment": None,
-                    "always_update": False,
-                    "full_width": False,
-                },
-                id="update_page",
-            ),
-            pytest.param(
-                "append_page",
-                "append_page",
-                {"page_id": "1", "title": "T", "append_body": "B"},
-                {
-                    "page_id": "1",
-                    "title": "T",
-                    "append_body": "B",
-                    "parent_id": None,
-                    "representation": "storage",
-                    "minor_edit": False,
-                },
-                id="append_page",
-            ),
-            pytest.param(
-                "get_page_by_id",
-                "get_page_by_id",
-                {"page_id": "1"},
-                {"page_id": "1", "expand": None, "status": None, "version": None},
-                id="get_page_by_id",
-            ),
-            pytest.param(
-                "get_page_by_title",
-                "get_page_by_title",
-                {"space": "S", "title": "T"},
-                {"space": "S", "title": "T", "start": 0, "limit": 1, "expand": None, "type": "page"},
-                id="get_page_by_title",
-            ),
-            pytest.param(
-                "get_all_pages_from_space",
-                "get_all_pages_from_space",
-                {"space": "S"},
-                {
-                    "space": "S",
-                    "start": 0,
-                    "limit": 50,
-                    "status": None,
-                    "expand": None,
-                    "content_type": "page",
-                },
-                id="get_all_pages_from_space",
-            ),
-            pytest.param(
-                "remove_page",
-                "remove_page",
-                {"page_id": "1"},
-                {"page_id": "1", "status": None, "recursive": False},
-                id="remove_page",
-            ),
-            pytest.param(
-                "move_page",
-                "move_page",
-                {"space_key": "S", "page_id": "1"},
-                {
-                    "space_key": "S",
-                    "page_id": "1",
-                    "target_id": None,
-                    "target_title": None,
-                    "position": "append",
-                },
-                id="move_page",
-            ),
-            pytest.param(
-                "search_cql",
-                "cql",
-                {"cql": 'type=page and space="S"'},
-                {
-                    "cql": 'type=page and space="S"',
-                    "start": 0,
-                    "limit": None,
-                    "expand": None,
-                    "include_archived_spaces": None,
-                    "excerpt": None,
-                },
-                id="search_cql",
-            ),
-            pytest.param(
-                "get_page_labels",
-                "get_page_labels",
-                {"page_id": "1"},
-                {"page_id": "1", "prefix": None, "start": None, "limit": None},
-                id="get_page_labels",
-            ),
-            pytest.param(
-                "set_page_label",
-                "set_page_label",
-                {"page_id": "1", "label": "L"},
-                {"page_id": "1", "label": "L"},
-                id="set_page_label",
-            ),
-            pytest.param(
-                "remove_page_label",
-                "remove_page_label",
-                {"page_id": "1", "label": "L"},
-                {"page_id": "1", "label": "L"},
-                id="remove_page_label",
-            ),
-            pytest.param(
-                "add_comment",
-                "add_comment",
-                {"page_id": "1", "text": "hi"},
-                {"page_id": "1", "text": "hi"},
-                id="add_comment",
-            ),
-            pytest.param(
-                "get_page_comments",
-                "get_page_comments",
-                {"content_id": "1"},
-                {
-                    "content_id": "1",
-                    "expand": None,
-                    "parent_version": None,
-                    "start": 0,
-                    "limit": 25,
-                    "location": None,
-                    "depth": None,
-                },
-                id="get_page_comments",
-            ),
-            pytest.param(
-                "attach_file",
-                "attach_file",
-                {"filename": "f.txt", "page_id": "1"},
-                {
-                    "filename": "f.txt",
-                    "name": None,
-                    "content_type": None,
-                    "page_id": "1",
-                    "title": None,
-                    "space": None,
-                    "comment": None,
-                },
-                id="attach_file",
-            ),
-            pytest.param(
-                "attach_content",
-                "attach_content",
-                {"content": b"data", "name": "f.txt", "page_id": "1"},
-                {
-                    "content": b"data",
-                    "name": "f.txt",
-                    "content_type": "application/binary",
-                    "page_id": "1",
-                    "title": None,
-                    "space": None,
-                    "comment": None,
-                },
-                id="attach_content",
-            ),
-            pytest.param(
-                "download_attachments_from_page",
-                "download_attachments_from_page",
-                {"page_id": "1"},
-                {
-                    "page_id": "1",
-                    "path": None,
-                    "start": 0,
-                    "limit": 50,
-                    "filename": None,
-                    "to_memory": False,
-                },
-                id="download_attachments_from_page",
-            ),
-            pytest.param(
-                "delete_attachment",
-                "delete_attachment",
-                {"page_id": "1", "filename": "f.txt"},
-                {"page_id": "1", "filename": "f.txt", "version": None},
-                id="delete_attachment",
-            ),
-            pytest.param(
-                "get_page_property",
-                "get_page_property",
-                {"page_id": "1", "page_property_key": "k"},
-                {"page_id": "1", "page_property_key": "k"},
-                id="get_page_property",
-            ),
-            pytest.param(
-                "set_page_property",
-                "set_page_property",
-                {"page_id": "1", "data": {"key": "k"}},
-                {"page_id": "1", "data": {"key": "k"}},
-                id="set_page_property",
-            ),
-            pytest.param(
-                "update_page_property",
-                "update_page_property",
-                {"page_id": "1", "data": {"key": "k"}},
-                {"page_id": "1", "data": {"key": "k"}},
-                id="update_page_property",
-            ),
-            pytest.param(
-                "delete_page_property",
-                "delete_page_property",
-                {"page_id": "1", "page_property": "k"},
-                {"page_id": "1", "page_property": "k"},
-                id="delete_page_property",
-            ),
-            pytest.param(
-                "get_all_restrictions_for_content",
-                "get_all_restrictions_for_content",
-                {"content_id": "1"},
-                {"content_id": "1"},
-                id="get_all_restrictions_for_content",
-            ),
+            ({"parent_id": "1", "parent_title": "P"}, "at most one of"),
+            ({"content_type": "blogpost", "parent_id": "1"}, "Blog posts cannot have a parent"),
+            ({"content_type": "blogpost", "parent_title": "P"}, "Blog posts cannot have a parent"),
+            ({"if_exists": "replace"}, "`if_exists` must be one of"),
         ],
     )
-    def test_wrapper_forwards_to_the_sdk(self, hook, hook_method, sdk_method, kwargs, expected):
-        client = hook.get_conn()
+    def test_invalid_arguments_are_rejected_before_any_request(self, deployment, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            deployment.hook.publish("SPACE", "Report", BODY, **kwargs)
 
-        result = getattr(hook, hook_method)(**kwargs)
+        deployment.client.get.assert_not_called()
 
-        getattr(client, sdk_method).assert_called_once_with(**expected)
-        assert result is getattr(client, sdk_method).return_value
+    def test_unknown_space_on_cloud(self, sdk, set_connection):
+        set_connection(host=CLOUD_URL)
+        sdk.cloud.get.return_value = {"results": []}
 
-    def test_export_page_is_positional(self, hook):
-        client = hook.get_conn()
+        with pytest.raises(ConfluenceSpaceNotFoundError):
+            ConfluenceHook().publish("SPACE", "Report", BODY)
 
-        result = hook.export_page("1")
+        sdk.cloud.post.assert_not_called()
 
-        client.export_page.assert_called_once_with("1")
-        assert result is client.export_page.return_value
+
+class TestDeleteContent:
+    @pytest.mark.parametrize("content_type", ["page", "blogpost"])
+    def test_deletes_by_id(self, deployment, content_type):
+        deployment.hook.delete_content("10", content_type=content_type)
+
+        deployment.client.delete.assert_called_once_with(f"{_collection(deployment, content_type)}/10")
+
+
+class TestSearchCql:
+    @pytest.mark.parametrize("host", [DC_URL, CLOUD_URL])
+    def test_returns_the_results(self, sdk, set_connection, host):
+        set_connection(host=host)
+        client = sdk.cloud if host == CLOUD_URL else sdk.server
+        client.get.return_value = {"results": [{"title": "A"}], "size": 1}
+
+        assert ConfluenceHook().search_cql('space = "DOCS"', limit=5) == [{"title": "A"}]
+        client.get.assert_called_once_with("rest/api/search", params={"cql": 'space = "DOCS"', "limit": 5})
+
+    def test_limit_defaults_to_25(self, sdk, set_connection):
+        set_connection()
+        sdk.server.get.return_value = {"results": []}
+
+        ConfluenceHook().search_cql("type = page")
+
+        sdk.server.get.assert_called_once_with("rest/api/search", params={"cql": "type = page", "limit": 25})

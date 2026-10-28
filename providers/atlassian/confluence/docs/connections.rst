@@ -20,8 +20,8 @@
 Atlassian Confluence Connection
 ===============================
 
-The Confluence connection type enables connection to Atlassian Confluence, both Cloud
-and Data Center.
+The Confluence connection type enables connection to Atlassian Confluence, both Cloud and
+Data Center.
 
 Default Connection IDs
 ----------------------
@@ -29,55 +29,94 @@ Default Connection IDs
 Confluence Hook uses the parameter ``confluence_conn_id`` for Connection IDs and the value
 of the parameter as ``confluence_default`` by default.
 
-Configuring the Connection
---------------------------
-Host
-    The Confluence host. A scheme may be included (``https://confluence.example.com``); when
-    it is omitted, ``https`` is assumed. Any path is preserved, so a Data Center instance
-    served under a context path such as ``confluence.example.com/wiki`` works as written.
+Authentication
+--------------
 
-Port
-    Optional port to connect to. A port already present in the host wins over this field.
-
-Login
-    The user authenticating against the Confluence API. Required unless ``token`` is set.
-
-Password
-    The password of that user. Required unless ``token`` is set.
-
-Verify SSL
-    Whether to verify SSL when connecting to the Confluence API (``True`` by default).
-
-API token / Personal Access Token
-    A Confluence Cloud API token or a Data Center Personal Access Token, stored in the
-    connection's ``extra`` field as ``token``. When set, it is used as the sole credential
-    and takes precedence over Login and Password.
+How you authenticate depends on the deployment:
 
 Confluence Cloud
-    Set for Confluence Cloud instances, stored in ``extra`` as ``cloud``. Atlassian-hosted
-    URLs (``*.atlassian.net``) are detected automatically, so this is only needed for a
-    Cloud instance served from a custom domain.
+    Cloud API tokens use basic authentication. Put the Atlassian account **email** in
+    *Login* and the `API token <https://id.atlassian.com/manage-profile/security/api-tokens>`__
+    in *Password*. The ``token`` extra is *not* accepted on Cloud: it sends a Bearer header, which
+    Cloud rejects for API tokens, so the hook raises an error instead of failing later with a 401.
+
+Confluence Data Center
+    Either a `Personal Access Token
+    <https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html>`__
+    in the ``token`` extra, or *Login* and *Password* for basic authentication. When both are
+    set, the token takes precedence.
+
+Configuring the Connection
+--------------------------
+
+Host
+    The full base URL of the Confluence site, including the scheme and any context path, for
+    example ``https://example.atlassian.net/wiki`` for Cloud or
+    ``https://confluence.example.com/confluence`` for Data Center. Without a scheme, ``https``
+    is assumed. Trailing slashes are ignored.
+
+Port
+    Optional port. It is applied only when the host URL does not already contain one, so a
+    port in the host always wins. IPv6 addresses work either way
+    (``https://[2001:db8::1]/confluence``).
+
+Login
+    The account email on Cloud, or the username for basic authentication on Data Center.
+
+Password
+    The API token on Cloud, or the password for basic authentication on Data Center.
+
+Schema
+    Not used. The field is hidden in the UI and is ignored when set, e.g. through a connection
+    URI. Put the scheme in *Host* instead.
+
+Deployment (optional)
+    The ``deployment`` extra: ``auto`` (default), ``cloud`` or ``data_center``. With ``auto``, a
+    host that is, or ends with, ``atlassian.net``, ``jira.com`` or ``api.atlassian.com`` is
+    treated as Cloud and everything else as Data Center. Set ``cloud`` explicitly for a Cloud
+    site served from a custom domain. Data Center uses the Confluence REST API v1 and Cloud
+    uses REST API v2.
+
+Data Center Personal Access Token (optional)
+    The ``token`` extra. Data Center only, see above.
+
+Verify SSL (optional)
+    The ``verify`` extra: ``true`` (default) or ``false``, as a JSON boolean or the string
+    ``"true"`` / ``"false"`` (case-insensitive). Any other value is rejected. Custom CA bundles
+    are not configurable here; use the standard ``REQUESTS_CA_BUNDLE`` environment variable.
 
 Examples
 --------
 
-A Cloud connection authenticating with an API token, as an environment variable:
+A Cloud connection, as an environment variable:
 
 .. code-block:: bash
 
     export AIRFLOW_CONN_CONFLUENCE_DEFAULT='{
         "conn_type": "confluence",
-        "host": "https://your-domain.atlassian.net",
-        "extra": {"token": "your-api-token", "cloud": true}
+        "host": "https://example.atlassian.net/wiki",
+        "login": "me@example.com",
+        "password": "your-api-token"
     }'
 
-A Data Center connection using basic authentication:
+A Data Center connection using a Personal Access Token:
 
 .. code-block:: bash
 
     export AIRFLOW_CONN_CONFLUENCE_DEFAULT='{
         "conn_type": "confluence",
-        "host": "https://confluence.example.com",
+        "host": "https://confluence.example.com/confluence",
+        "extra": {"token": "your-personal-access-token"}
+    }'
+
+A Data Center connection using basic authentication on a non-default port:
+
+.. code-block:: bash
+
+    export AIRFLOW_CONN_CONFLUENCE_DEFAULT='{
+        "conn_type": "confluence",
+        "host": "https://confluence.example.com/confluence",
+        "port": 8443,
         "login": "airflow",
         "password": "your-password"
     }'

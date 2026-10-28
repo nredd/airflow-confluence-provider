@@ -19,34 +19,344 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import warnings
+from abc import ABC, abstractmethod
+from collections.abc import MutableMapping
+from dataclasses import dataclass
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 
-from atlassian import Confluence
+from atlassian import ConfluenceServer, ConfluenceV2
 
-from airflow.providers.atlassian.confluence.exceptions import ConfluenceConnectionError
+from airflow.providers.atlassian.confluence.exceptions import (
+    ConfluenceConnectionError,
+    ConfluenceContentExistsError,
+    ConfluenceContentNotFoundError,
+    ConfluenceSpaceNotFoundError,
+)
 from airflow.providers.common.compat.sdk import BaseHook
 
 if TYPE_CHECKING:
     from airflow.providers.common.compat.sdk import Connection
 
+ContentType = Literal["page", "blogpost"]
+IfExists = Literal["update", "skip", "fail"]
+Action = Literal["created", "updated", "skipped"]
+
+IF_EXISTS_CHOICES: tuple[str, ...] = ("update", "skip", "fail")
+
+# Hostnames (and their subdomains) that the SDK itself treats as Confluence Cloud.
+_CLOUD_DOMAINS = ("atlassian.net", "jira.com", "api.atlassian.com")
+_DEPLOYMENTS = ("auto", "cloud", "data_center")
+
+
+class ConfluenceContent(TypedDict):
+    """Summary of a page or blog post, as returned by :class:`ConfluenceHook`."""
+
+    id: str
+    type: str
+    title: str
+    space: str
+    version: int
+    url: str | None
+    action: Action
+
+
+@dataclass(frozen=True)
+class _ConnectionSettings:
+    """Client settings resolved from an Airflow Connection."""
+
+    url: str
+    cloud: bool
+    verify: bool
+    login: str | None
+    password: str | None
+    token: str | None
+
+
+def _coerce_verify(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise ConfluenceConnectionError(f"The `verify` extra must be true or false, got {value!r}")
+
+
+def _build_base_url(conn: Connection) -> str:
+    """Build the base URL from the connection's host, applying ``port`` only if the URL has none."""
+    host = str(conn.host).strip()
+    parts = urlsplit(host if "://" in host else f"https://{host}")
+    try:
+        has_port = parts.port is not None
+    except ValueError as e:
+        raise ConfluenceConnectionError(f"The Confluence host {host!r} has an invalid port") from e
+
+    netloc = parts.netloc
+    if conn.port and not has_port:
+        netloc = f"{netloc}:{conn.port}"
+    return urlunsplit(parts._replace(netloc=netloc, path=parts.path.rstrip("/")))
+
+
+def _quote_cql(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _is_cloud_hostname(url: str) -> bool:
+    hostname = (urlsplit(url).hostname or "").lower()
+    return any(hostname == domain or hostname.endswith(f".{domain}") for domain in _CLOUD_DOMAINS)
+
+
+def _resolve_connection_settings(conn: Connection) -> _ConnectionSettings:
+    """Turn a Connection into validated client settings; the one place connection rules live."""
+    if not conn.host:
+        raise ConfluenceConnectionError("Failed to create Confluence client: host is required")
+
+    extras = conn.extra_dejson if conn.extra else {}
+    deployment = extras.get("deployment") or "auto"
+    if deployment not in _DEPLOYMENTS:
+        raise ConfluenceConnectionError(
+            f"The `deployment` extra must be one of {', '.join(_DEPLOYMENTS)}, got {deployment!r}"
+        )
+
+    url = _build_base_url(conn)
+    cloud = _is_cloud_hostname(url) if deployment == "auto" else deployment == "cloud"
+    token = extras.get("token") or None
+
+    if cloud:
+        if token:
+            raise ConfluenceConnectionError(
+                "Confluence Cloud does not accept the `token` extra: put the account email in "
+                "Login and the API token in Password"
+            )
+        if not (conn.login and conn.password):
+            raise ConfluenceConnectionError(
+                "Confluence Cloud requires both Login (account email) and Password (API token)"
+            )
+    elif not token and not (conn.login and conn.password):
+        raise ConfluenceConnectionError(
+            "Confluence Data Center requires either the `token` extra or both Login and Password"
+        )
+
+    return _ConnectionSettings(
+        url=url,
+        cloud=cloud,
+        verify=_coerce_verify(extras.get("verify")),
+        login=conn.login or None,
+        password=conn.password or None,
+        token=token,
+    )
+
+
+class _ContentApi(ABC):
+    """The REST shapes for finding, creating, updating and deleting content on one deployment."""
+
+    def __init__(self, client: ConfluenceServer | ConfluenceV2) -> None:
+        self._client = client
+
+    @abstractmethod
+    def find(self, space: str, title: str, content_type: ContentType) -> ConfluenceContent | None:
+        """Return the content titled ``title`` in ``space``, if any."""
+
+    @abstractmethod
+    def create(
+        self, space: str, title: str, body: str, content_type: ContentType, parent_id: str | None
+    ) -> ConfluenceContent:
+        """Create content and return its summary."""
+
+    @abstractmethod
+    def update(
+        self, existing: ConfluenceContent, body: str, version_comment: str | None
+    ) -> ConfluenceContent:
+        """Replace the body of ``existing`` with a new version and return its summary."""
+
+    @abstractmethod
+    def delete(self, content_id: str, content_type: ContentType) -> None:
+        """Delete content by ID."""
+
+    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        return cast("dict[str, Any]", self._client.get(path, params=params))
+
+    def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        return cast("dict[str, Any]", self._client.post(path, data=data))
+
+    def _put(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        return cast("dict[str, Any]", self._client.put(path, data=data))
+
+    @staticmethod
+    def _summarize(
+        item: dict[str, Any],
+        *,
+        space: str,
+        content_type: ContentType,
+        action: Action,
+        list_base: str | None = None,
+    ) -> ConfluenceContent:
+        links = item.get("_links") or {}
+        base = links.get("base") or list_base
+        webui = links.get("webui")
+        return ConfluenceContent(
+            id=str(item["id"]),
+            type=content_type,
+            title=item["title"],
+            space=space,
+            version=int(item["version"]["number"]),
+            url=f"{base}{webui}" if base and webui else None,
+            action=action,
+        )
+
+    @staticmethod
+    def _build_version(number: int, comment: str | None) -> dict[str, Any]:
+        return {"number": number, "message": comment} if comment else {"number": number}
+
+
+class _DataCenterContentApi(_ContentApi):
+    """Confluence Data Center: REST v1 (``rest/api/content``)."""
+
+    def find(self, space: str, title: str, content_type: ContentType) -> ConfluenceContent | None:
+        if content_type == "blogpost":
+            # ``rest/api/content`` requires ``postingDay`` to look up blog posts by title.
+            cql = f"space = {_quote_cql(space)} and type = blogpost and title = {_quote_cql(title)}"
+            response = self._get(
+                "rest/api/content/search", {"cql": cql, "expand": "version,space", "limit": 1}
+            )
+        else:
+            response = self._get(
+                "rest/api/content",
+                {
+                    "spaceKey": space,
+                    "title": title,
+                    "type": content_type,
+                    "expand": "version,space",
+                    "limit": 1,
+                },
+            )
+        results = response.get("results") or []
+        if not results:
+            return None
+        return self._summarize(
+            results[0],
+            space=space,
+            content_type=content_type,
+            action="skipped",
+            list_base=(response.get("_links") or {}).get("base"),
+        )
+
+    def create(
+        self, space: str, title: str, body: str, content_type: ContentType, parent_id: str | None
+    ) -> ConfluenceContent:
+        payload = self._build_payload(space, title, body, content_type)
+        if parent_id:
+            payload["ancestors"] = [{"id": parent_id}]
+        item = self._post("rest/api/content", payload)
+        return self._summarize(item, space=space, content_type=content_type, action="created")
+
+    def update(
+        self, existing: ConfluenceContent, body: str, version_comment: str | None
+    ) -> ConfluenceContent:
+        content_type = cast("ContentType", existing["type"])
+        payload = self._build_payload(existing["space"], existing["title"], body, content_type)
+        payload["id"] = existing["id"]
+        payload["version"] = self._build_version(existing["version"] + 1, version_comment)
+        item = self._put(f"rest/api/content/{existing['id']}", payload)
+        return self._summarize(item, space=existing["space"], content_type=content_type, action="updated")
+
+    def delete(self, content_id: str, content_type: ContentType) -> None:
+        self._client.delete(f"rest/api/content/{content_id}")
+
+    @staticmethod
+    def _build_payload(space: str, title: str, body: str, content_type: ContentType) -> dict[str, Any]:
+        return {
+            "type": content_type,
+            "title": title,
+            "space": {"key": space},
+            "body": {"storage": {"value": body, "representation": "storage"}},
+        }
+
+
+class _CloudContentApi(_ContentApi):
+    """Confluence Cloud: REST v2 (``api/v2/pages`` and ``api/v2/blogposts``)."""
+
+    _COLLECTIONS: dict[str, str] = {"page": "api/v2/pages", "blogpost": "api/v2/blogposts"}
+
+    def __init__(self, client: ConfluenceServer | ConfluenceV2) -> None:
+        super().__init__(client)
+        self._space_ids: dict[str, str] = {}
+
+    def find(self, space: str, title: str, content_type: ContentType) -> ConfluenceContent | None:
+        response = self._get(
+            self._COLLECTIONS[content_type],
+            {"space-id": self._get_space_id(space), "title": title, "status": "current", "limit": 1},
+        )
+        results = response.get("results") or []
+        if not results:
+            return None
+        return self._summarize(
+            results[0],
+            space=space,
+            content_type=content_type,
+            action="skipped",
+            list_base=(response.get("_links") or {}).get("base"),
+        )
+
+    def create(
+        self, space: str, title: str, body: str, content_type: ContentType, parent_id: str | None
+    ) -> ConfluenceContent:
+        payload: dict[str, Any] = {
+            "spaceId": self._get_space_id(space),
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": body},
+        }
+        if parent_id:
+            payload["parentId"] = parent_id
+        item = self._post(self._COLLECTIONS[content_type], payload)
+        return self._summarize(item, space=space, content_type=content_type, action="created")
+
+    def update(
+        self, existing: ConfluenceContent, body: str, version_comment: str | None
+    ) -> ConfluenceContent:
+        content_type = cast("ContentType", existing["type"])
+        payload = {
+            "id": existing["id"],
+            "status": "current",
+            "title": existing["title"],
+            "body": {"representation": "storage", "value": body},
+            "version": self._build_version(existing["version"] + 1, version_comment),
+        }
+        item = self._put(f"{self._COLLECTIONS[content_type]}/{existing['id']}", payload)
+        return self._summarize(item, space=existing["space"], content_type=content_type, action="updated")
+
+    def delete(self, content_id: str, content_type: ContentType) -> None:
+        self._client.delete(f"{self._COLLECTIONS[content_type]}/{content_id}")
+
+    def _get_space_id(self, space_key: str) -> str:
+        if space_key not in self._space_ids:
+            results = self._get("api/v2/spaces", {"keys": space_key}).get("results") or []
+            if not results:
+                raise ConfluenceSpaceNotFoundError(f"Confluence space {space_key!r} was not found")
+            self._space_ids[space_key] = str(results[0]["id"])
+        return self._space_ids[space_key]
+
 
 class ConfluenceHook(BaseHook):
     """
-    Confluence interaction hook, a wrapper around the Atlassian Confluence Python SDK.
+    Interact with Atlassian Confluence, Cloud or Data Center.
 
-    The client is created lazily on first use, so instantiating the hook never
-    performs I/O and never requires a reachable Confluence instance.
+    The hook owns the operations that need provider logic: connecting, finding and publishing
+    pages and blog posts, deleting content and CQL search. For everything else call
+    :meth:`get_conn` and use the `atlassian-python-api
+    <https://atlassian-python-api.readthedocs.io/confluence.html>`__ client directly.
 
-    Authentication is taken from the Airflow Connection. When the ``token`` extra is
-    set it is used as the sole credential (Confluence Cloud API token, or a Data
-    Center Personal Access Token); otherwise the connection's login and password are
-    used for basic authentication.
+    The client is created lazily on first use, so instantiating the hook never performs I/O
+    and never requires a reachable Confluence instance. Data Center uses REST v1 and Cloud
+    uses REST v2; the deployment is taken from the connection's ``deployment`` extra.
 
     :param confluence_conn_id: reference to a pre-defined Confluence Connection
     :param proxies: Proxies to make the Confluence REST API call. Optional
-    :param api_root: root for the api requests. Optional
-    :param api_version: Confluence api version to use. Optional
     """
 
     conn_name_attr = "confluence_conn_id"
@@ -57,98 +367,31 @@ class ConfluenceHook(BaseHook):
     def __init__(
         self,
         confluence_conn_id: str = default_conn_name,
-        proxies: Any | None = None,
-        api_root: str = "rest/api",
-        api_version: str | int = "latest",
+        proxies: MutableMapping[str, str] | None = None,
     ) -> None:
         super().__init__()
         self.confluence_conn_id = confluence_conn_id
         self.proxies = proxies
-        self.api_root = api_root
-        self.api_version = api_version
-        self.client: Confluence | None = None
-
-    def get_conn(self) -> Confluence:
-        """Return an initialized Atlassian Confluence SDK client, creating it on first call."""
-        if self.client:
-            return self.client
-
-        self.log.debug("Creating Confluence client for conn_id: %s", self.confluence_conn_id)
-
-        if not self.confluence_conn_id:
-            raise ConfluenceConnectionError(
-                "Failed to create Confluence client: confluence_conn_id is required"
-            )
-
-        conn = self.get_connection(self.confluence_conn_id)
-        extras = conn.extra_dejson if conn.extra else {}
-        token = extras.get("token")
-        self._validate_connection(conn, token=token)
-
-        credentials: dict[str, Any] = (
-            {"token": token} if token else {"username": conn.login, "password": conn.password}
-        )
-        # Omitted when unset so the SDK's own atlassian.net/jira.com host detection can run;
-        # passing cloud= at all (even False) disables that detection.
-        cloud_kwarg: dict[str, Any] = {"cloud": extras["cloud"]} if "cloud" in extras else {}
-
-        self.client = Confluence(
-            url=self._connection_url(conn),
-            verify_ssl=extras.get("verify", True),
-            proxies=self.proxies,
-            api_version=self.api_version,
-            api_root=self.api_root,
-            **credentials,
-            **cloud_kwarg,
-        )
-        return self.client
-
-    @staticmethod
-    def _validate_connection(conn: Connection, *, token: str | None) -> None:
-        """Check that the connection carries a host and a usable set of credentials."""
-        if not conn.host:
-            raise ConfluenceConnectionError("Failed to create Confluence client: host is required")
-
-        if not token and not (conn.login and conn.password):
-            raise ConfluenceConnectionError(
-                "Failed to create Confluence client: either the `token` extra or both "
-                "login and password are required"
-            )
-
-    @staticmethod
-    def _connection_url(conn: Connection) -> str:
-        """Build a Confluence base URL from the connection's host, schema and port."""
-        host = str(conn.host)
-        url = host if "://" in host else f"{conn.schema or 'https'}://{host}"
-
-        if not conn.port:
-            return url
-
-        parsed = urlsplit(url)
-        # A port already spelled out in the host wins over the connection's port field.
-        if ":" in parsed.netloc.rsplit("@", 1)[-1]:
-            return url
-
-        return urlunsplit(
-            (
-                parsed.scheme,
-                f"{parsed.netloc}:{conn.port}",
-                parsed.path,
-                parsed.query,
-                parsed.fragment,
-            )
-        )
+        self._client: ConfluenceServer | ConfluenceV2 | None = None
 
     @classmethod
     def get_connection_form_widgets(cls) -> dict[str, Any]:
         """Return connection widgets to add to the Atlassian Confluence connection form."""
-        from flask_babel import lazy_gettext
-        from wtforms import BooleanField, PasswordField
+        # Only needed on Airflow 3.0 and 3.1; remove once the Airflow floor reaches 3.2, where
+        # the ``conn-fields`` in provider.yaml take over.
+        try:
+            from wtforms import BooleanField, PasswordField, SelectField
+        except ImportError:
+            return {}
 
         return {
-            "verify": BooleanField(lazy_gettext("Verify SSL"), default=True),
-            "token": PasswordField(lazy_gettext("API token / Personal Access Token")),
-            "cloud": BooleanField(lazy_gettext("Confluence Cloud"), default=False),
+            "deployment": SelectField(
+                "Deployment",
+                choices=[("auto", "Auto-detect"), ("cloud", "Cloud"), ("data_center", "Data Center")],
+                default="auto",
+            ),
+            "token": PasswordField("Data Center Personal Access Token"),
+            "verify": BooleanField("Verify SSL", default=True),
         }
 
     @classmethod
@@ -156,507 +399,174 @@ class ConfluenceHook(BaseHook):
         """Return custom UI field behaviour for the Atlassian Confluence connection."""
         return {
             "hidden_fields": ["schema"],
+            "relabeling": {"login": "Username / Email", "password": "Password / API token"},
+            "placeholders": {"host": "https://example.atlassian.net/wiki"},
         }
 
-    # Pages
-
-    def create_page(
-        self,
-        space: str,
-        title: str,
-        body: str,
-        parent_id: str | None = None,
-        representation: str = "storage",
-        editor: str | None = None,
-        full_width: bool = False,
-        status: str = "current",
-    ) -> dict[str, Any]:
-        """Create a new page in a space."""
-        return self.get_conn().create_page(
-            space=space,
-            title=title,
-            body=body,
-            parent_id=parent_id,
-            representation=representation,
-            editor=editor,
-            full_width=full_width,
-            status=status,
-        )
-
-    def update_page(
-        self,
-        page_id: str,
-        title: str,
-        body: str | None = None,
-        parent_id: str | None = None,
-        representation: str = "storage",
-        minor_edit: bool = False,
-        version_comment: str | None = None,
-        always_update: bool = False,
-        full_width: bool = False,
-    ) -> dict[str, Any]:
-        """Update an existing page."""
-        return self.get_conn().update_page(
-            page_id=page_id,
-            title=title,
-            body=body,
-            parent_id=parent_id,
-            representation=representation,
-            minor_edit=minor_edit,
-            version_comment=version_comment,
-            always_update=always_update,
-            full_width=full_width,
-        )
-
-    def append_page(
-        self,
-        page_id: str,
-        title: str,
-        append_body: str,
-        parent_id: str | None = None,
-        representation: str = "storage",
-        minor_edit: bool = False,
-    ) -> dict[str, Any]:
-        """Append content to the end of an existing page."""
-        return self.get_conn().append_page(
-            page_id=page_id,
-            title=title,
-            append_body=append_body,
-            parent_id=parent_id,
-            representation=representation,
-            minor_edit=minor_edit,
-        )
-
-    def get_page_by_id(
-        self,
-        page_id: str,
-        expand: str | None = None,
-        status: str | None = None,
-        version: int | None = None,
-    ) -> dict[str, Any]:
-        """Return a page by its content ID."""
-        return self.get_conn().get_page_by_id(page_id=page_id, expand=expand, status=status, version=version)
-
-    def get_page_by_title(
-        self,
-        space: str,
-        title: str,
-        start: int = 0,
-        limit: int = 1,
-        expand: str | None = None,
-    ) -> dict[str, Any] | None:
-        """Return the first page in a space matching a title, or ``None`` when absent."""
-        return self.get_conn().get_page_by_title(
-            space=space, title=title, start=start, limit=limit, expand=expand, type="page"
-        )
-
-    def get_all_pages_from_space(
-        self,
-        space: str,
-        start: int = 0,
-        limit: int = 50,
-        status: str | None = None,
-        expand: str | None = None,
-        content_type: str = "page",
-    ) -> list[dict[str, Any]]:
-        """Return a page of results listing the content of a space."""
-        return self.get_conn().get_all_pages_from_space(
-            space=space,
-            start=start,
-            limit=limit,
-            status=status,
-            expand=expand,
-            content_type=content_type,
-        )
-
-    def remove_page(self, page_id: str, status: str | None = None, recursive: bool = False) -> dict[str, Any]:
-        """Delete a page, optionally together with its descendants."""
-        return self.get_conn().remove_page(page_id=page_id, status=status, recursive=recursive)
-
-    def move_page(
-        self,
-        space_key: str,
-        page_id: str,
-        target_id: str | None = None,
-        target_title: str | None = None,
-        position: str = "append",
-    ) -> dict[str, Any]:
-        """Move a page relative to another page in the tree."""
-        return self.get_conn().move_page(
-            space_key=space_key,
-            page_id=page_id,
-            target_id=target_id,
-            target_title=target_title,
-            position=position,
-        )
-
-    def export_page(self, page_id: str) -> bytes:
-        """Export a page as PDF and return the raw document bytes."""
-        return self.get_conn().export_page(page_id)
-
-    # Page lookup helpers
-
-    def find_child_page_by_title(
-        self, parent_page_id: str, title: str, *, page_type: str = "page"
-    ) -> str | None:
-        """
-        Return the ID of the direct child of ``parent_page_id`` titled ``title``.
-
-        Neither ``start`` nor ``limit`` is passed to the SDK, which makes it return a
-        fully paginated generator over every child rather than a single capped page —
-        so the search is not silently truncated on parents with many children.
-
-        :param parent_page_id: content ID of the parent page
-        :param title: exact title of the child to look for
-        :param page_type: child content type to search, e.g. ``page`` or ``blogpost``
-        :return: the child's content ID, or ``None`` when no child matches
-        """
-        children = self.get_conn().get_page_child_by_type(parent_page_id, type=page_type)
-        for child in children or ():
-            if child.get("title") == title:
-                return child.get("id")
-        return None
-
-    def get_or_create_page(
-        self,
-        title: str,
-        body: str,
-        space: str | None = None,
-        parent_id: str | None = None,
-        representation: str = "storage",
-        minor_edit: bool = False,
-        version_comment: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Create a page, or update it in place when one with the same title already exists.
-
-        Concurrent writes to the same page raise ``atlassian.errors.ApiConflictError``
-        (HTTP 409) rather than being retried here; set ``retries`` on the task to have
-        Airflow handle that.
-
-        :param title: title of the page to create or update
-        :param body: page body in the format given by ``representation``
-        :param space: space key; required when ``parent_id`` is not given, and ignored
-            when it is, since the space is then taken from the parent
-        :param parent_id: content ID of the parent page; when omitted the page is
-            created at the top level of ``space``
-        :param representation: body markup format, either ``storage`` or ``wiki``
-        :param minor_edit: when set, watchers are not notified about the change
-        :param version_comment: comment recorded against the new page version
-        """
-        if parent_id is not None:
-            return self.get_conn().update_or_create(
-                parent_id=parent_id,
-                title=title,
-                body=body,
-                representation=representation,
-                minor_edit=minor_edit,
-                version_comment=version_comment,
+    @cached_property
+    def _settings(self) -> _ConnectionSettings:
+        if not self.confluence_conn_id:
+            raise ConfluenceConnectionError(
+                "Failed to create Confluence client: confluence_conn_id is required"
             )
+        return _resolve_connection_settings(self.get_connection(self.confluence_conn_id))
 
-        if not space:
-            raise ValueError("`space` is required when `parent_id` is not given")
+    @cached_property
+    def is_cloud(self) -> bool:
+        """Whether the connection points at Confluence Cloud rather than Data Center."""
+        return self._settings.cloud
 
-        existing = self.get_page_by_title(space=space, title=title)
-        if existing:
-            return self.update_page(
-                page_id=existing["id"],
-                title=title,
-                body=body,
-                representation=representation,
-                minor_edit=minor_edit,
-                version_comment=version_comment,
+    @cached_property
+    def _content_api(self) -> _ContentApi:
+        client = self.get_conn()
+        return _CloudContentApi(client) if self.is_cloud else _DataCenterContentApi(client)
+
+    def get_conn(self) -> ConfluenceServer | ConfluenceV2:
+        """
+        Return the `atlassian-python-api` client, creating it on first call.
+
+        The client is a ``ConfluenceV2`` on Cloud and a ``ConfluenceServer`` on Data Center.
+        """
+        if self._client is not None:
+            return self._client
+
+        settings = self._settings
+        self.log.debug("Creating Confluence client for conn_id: %s", self.confluence_conn_id)
+
+        if settings.cloud:
+            # ConfluenceV2 warns about its own legacy v1 methods on every construction, which
+            # this hook never calls.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                self._client = ConfluenceV2(
+                    url=settings.url,
+                    username=settings.login,
+                    password=settings.password,
+                    verify_ssl=settings.verify,
+                    proxies=self.proxies,
+                )
+        elif settings.token:
+            self._client = ConfluenceServer(
+                url=settings.url, token=settings.token, verify_ssl=settings.verify, proxies=self.proxies
             )
-        return self.create_page(space=space, title=title, body=body, representation=representation)
+        else:
+            self._client = ConfluenceServer(
+                url=settings.url,
+                username=settings.login,
+                password=settings.password,
+                verify_ssl=settings.verify,
+                proxies=self.proxies,
+            )
+        return self._client
 
-    # Blog posts
+    def test_connection(self) -> tuple[bool, str]:
+        """Check the credentials by fetching the current user."""
+        try:
+            user = cast("dict[str, Any]", self.get_conn().get("rest/api/user/current"))
+        except Exception as e:
+            return False, str(e)
+        if user.get("type") == "anonymous":
+            return False, "Connected, but the credentials were not accepted (anonymous user)"
+        return True, "Connection successfully tested"
 
-    def create_blog_post(
+    def find_content(
+        self, space: str, title: str, *, content_type: ContentType = "page"
+    ) -> ConfluenceContent | None:
+        """
+        Find a page or blog post by title within a space.
+
+        :param space: key of the space to search
+        :param title: exact title of the content
+        :param content_type: ``page`` or ``blogpost``
+        :return: the content summary, or ``None`` when there is no match. Nothing is
+            written, so ``action`` is always ``skipped``.
+        """
+        return self._content_api.find(space, title, content_type)
+
+    def publish(
         self,
         space: str,
         title: str,
         body: str,
-        representation: str = "storage",
-        status: str = "current",
-    ) -> dict[str, Any]:
-        """Create a blog post in a space. Blog posts are flat — they have no parent."""
-        return self.get_conn().create_page(
-            space=space,
-            title=title,
-            body=body,
-            type="blogpost",
-            representation=representation,
-            status=status,
-        )
-
-    def update_blog_post(
-        self,
-        page_id: str,
-        title: str,
-        body: str | None = None,
-        representation: str = "storage",
-        minor_edit: bool = False,
+        *,
+        content_type: ContentType = "page",
+        parent_id: str | None = None,
+        parent_title: str | None = None,
+        if_exists: IfExists = "update",
         version_comment: str | None = None,
-    ) -> dict[str, Any]:
-        """Update an existing blog post."""
-        return self.get_conn().update_page(
-            page_id=page_id,
-            title=title,
-            body=body,
-            type="blogpost",
-            representation=representation,
-            minor_edit=minor_edit,
-            version_comment=version_comment,
-        )
-
-    def get_blog_post_by_title(
-        self, space: str, title: str, expand: str | None = None
-    ) -> dict[str, Any] | None:
-        """Return the first blog post in a space matching a title, or ``None`` when absent."""
-        return self.get_conn().get_page_by_title(space=space, title=title, expand=expand, type="blogpost")
-
-    def get_or_create_blog_post(
-        self,
-        space: str,
-        title: str,
-        body: str,
-        representation: str = "storage",
-        minor_edit: bool = False,
-        version_comment: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> ConfluenceContent:
         """
-        Create a blog post, or update it in place when one with the same title already exists.
+        Create a page or blog post, or handle the existing one with the same title.
 
-        As with :meth:`get_or_create_page`, HTTP 409 conflicts are not retried here —
-        use the task's ``retries`` instead.
+        Existing content is found by title within ``space`` and, for ``if_exists="update"``,
+        updated in place wherever it lives in the page tree. The parent therefore only
+        applies when the content is created.
+
+        :param space: key of the space to publish into
+        :param title: title of the content
+        :param body: body in Confluence storage format
+        :param content_type: ``page`` or ``blogpost``
+        :param parent_id: content ID of the parent page; pages only, mutually exclusive
+            with ``parent_title``
+        :param parent_title: title of the parent page, resolved within ``space``; pages
+            only, mutually exclusive with ``parent_id``
+        :param if_exists: what to do when the title exists: ``update`` writes a new version,
+            ``skip`` returns the existing content untouched, ``fail`` raises
+            :class:`~airflow.providers.atlassian.confluence.exceptions.ConfluenceContentExistsError`
+        :param version_comment: comment recorded against the new version on update
+        :raises ValueError: for invalid argument combinations
+        :raises ConfluenceContentNotFoundError: when ``parent_title`` does not exist in ``space``
+        :raises ConfluenceSpaceNotFoundError: when ``space`` does not exist (Cloud)
+        :return: the content summary; ``action`` says what was done
         """
-        existing = self.get_blog_post_by_title(space=space, title=title)
-        if existing:
-            return self.update_blog_post(
-                page_id=existing["id"],
-                title=title,
-                body=body,
-                representation=representation,
-                minor_edit=minor_edit,
-                version_comment=version_comment,
-            )
-        return self.create_blog_post(space=space, title=title, body=body, representation=representation)
+        if if_exists not in IF_EXISTS_CHOICES:
+            raise ValueError(f"`if_exists` must be one of {', '.join(IF_EXISTS_CHOICES)}, got {if_exists!r}")
+        if parent_id and parent_title:
+            raise ValueError("Give at most one of `parent_id` and `parent_title`, not both")
+        if content_type == "blogpost" and (parent_id or parent_title):
+            raise ValueError("Blog posts cannot have a parent")
 
-    # Search
+        api = self._content_api
+        existing = api.find(space, title, content_type)
+        if existing is not None:
+            if if_exists == "fail":
+                raise ConfluenceContentExistsError(
+                    f"A {content_type} titled {title!r} already exists in space {space!r} (id {existing['id']})"
+                )
+            if if_exists == "skip":
+                return existing
+            result = api.update(existing, body, version_comment)
+        else:
+            if parent_title:
+                parent = api.find(space, parent_title, "page")
+                if parent is None:
+                    raise ConfluenceContentNotFoundError(
+                        f"Parent page titled {parent_title!r} was not found in space {space!r}"
+                    )
+                parent_id = parent["id"]
+            result = api.create(space, title, body, content_type, parent_id)
 
-    def search_cql(
-        self,
-        cql: str,
-        start: int = 0,
-        limit: int | None = None,
-        expand: str | None = None,
-        include_archived_spaces: bool | None = None,
-        excerpt: str | None = None,
-    ) -> dict[str, Any]:
+        self.log.info("Confluence %s %r %s (id %s)", content_type, title, result["action"], result["id"])
+        return result
+
+    def delete_content(self, content_id: str, *, content_type: ContentType = "page") -> None:
         """
-        Search for content using the Confluence Query Language.
+        Delete a page or blog post by ID.
 
-        :param cql: the CQL query to run
-        :param start: index of the first result to return
+        :param content_id: ID of the content to delete
+        :param content_type: ``page`` or ``blogpost``
+        """
+        self._content_api.delete(content_id, content_type)
+
+    def search_cql(self, cql: str, *, limit: int = 25) -> list[dict[str, Any]]:
+        """
+        Search content with the Confluence Query Language.
+
+        :param cql: the CQL query, e.g. ``space = "DOCS" and type = page``
         :param limit: maximum number of results to return
-        :param expand: properties to expand on each result
-        :param include_archived_spaces: whether to search archived spaces too
-        :param excerpt: excerpt strategy, one of ``indexed``, ``highlight`` or ``none``
+        :return: the ``results`` of the search response
         """
-        return self.get_conn().cql(
-            cql=cql,
-            start=start,
-            limit=limit,
-            expand=expand,
-            include_archived_spaces=include_archived_spaces,
-            excerpt=excerpt,
+        response = cast(
+            "dict[str, Any]", self.get_conn().get("rest/api/search", params={"cql": cql, "limit": limit})
         )
-
-    # Labels
-
-    def get_page_labels(
-        self,
-        page_id: str,
-        prefix: str | None = None,
-        start: int | None = None,
-        limit: int | None = None,
-    ) -> dict[str, Any]:
-        """Return the labels attached to a page."""
-        return self.get_conn().get_page_labels(page_id=page_id, prefix=prefix, start=start, limit=limit)
-
-    def set_page_label(self, page_id: str, label: str) -> dict[str, Any]:
-        """Add a label to a page."""
-        return self.get_conn().set_page_label(page_id=page_id, label=label)
-
-    def remove_page_label(self, page_id: str, label: str) -> dict[str, Any]:
-        """Remove a label from a page."""
-        return self.get_conn().remove_page_label(page_id=page_id, label=label)
-
-    # Comments
-
-    def add_comment(self, page_id: str, text: str) -> dict[str, Any]:
-        """Add a comment to a page."""
-        return self.get_conn().add_comment(page_id=page_id, text=text)
-
-    def get_page_comments(
-        self,
-        content_id: str,
-        expand: str | None = None,
-        parent_version: int | None = None,
-        start: int = 0,
-        limit: int = 25,
-        location: str | None = None,
-        depth: str | None = None,
-    ) -> dict[str, Any]:
-        """Return the comments on a page."""
-        return self.get_conn().get_page_comments(
-            content_id=content_id,
-            expand=expand,
-            parent_version=parent_version,
-            start=start,
-            limit=limit,
-            location=location,
-            depth=depth,
-        )
-
-    # Attachments
-
-    def attach_file(
-        self,
-        filename: str,
-        name: str | None = None,
-        content_type: str | None = None,
-        page_id: str | None = None,
-        title: str | None = None,
-        space: str | None = None,
-        comment: str | None = None,
-    ) -> dict[str, Any]:
-        """Upload a file from disk as an attachment on a page."""
-        return self.get_conn().attach_file(
-            filename=filename,
-            name=name,
-            content_type=content_type,
-            page_id=page_id,
-            title=title,
-            space=space,
-            comment=comment,
-        )
-
-    def attach_content(
-        self,
-        content: bytes,
-        name: str,
-        content_type: str = "application/binary",
-        page_id: str | None = None,
-        title: str | None = None,
-        space: str | None = None,
-        comment: str | None = None,
-    ) -> dict[str, Any]:
-        """Upload in-memory content as an attachment on a page."""
-        return self.get_conn().attach_content(
-            content=content,
-            name=name,
-            content_type=content_type,
-            page_id=page_id,
-            title=title,
-            space=space,
-            comment=comment,
-        )
-
-    def download_attachments_from_page(
-        self,
-        page_id: str,
-        path: str | None = None,
-        start: int = 0,
-        limit: int = 50,
-        filename: str | None = None,
-        to_memory: bool = False,
-    ) -> Any:
-        """
-        Download a page's attachments to a directory, or into memory.
-
-        With ``to_memory`` set, returns a mapping of filename to ``BytesIO``; otherwise
-        writes the files under ``path`` and returns a summary of what was downloaded.
-        """
-        return self.get_conn().download_attachments_from_page(
-            page_id=page_id,
-            path=path,
-            start=start,
-            limit=limit,
-            filename=filename,
-            to_memory=to_memory,
-        )
-
-    def delete_attachment(self, page_id: str, filename: str, version: int | None = None) -> dict[str, Any]:
-        """Delete an attachment from a page."""
-        return self.get_conn().delete_attachment(page_id=page_id, filename=filename, version=version)
-
-    # Content properties
-
-    def get_page_property(self, page_id: str, page_property_key: str) -> dict[str, Any]:
-        """Return a single content property of a page."""
-        return self.get_conn().get_page_property(page_id=page_id, page_property_key=page_property_key)
-
-    def set_page_property(self, page_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Create a content property on a page."""
-        return self.get_conn().set_page_property(page_id=page_id, data=data)
-
-    def update_page_property(self, page_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Update an existing content property of a page."""
-        return self.get_conn().update_page_property(page_id=page_id, data=data)
-
-    def delete_page_property(self, page_id: str, page_property: str) -> dict[str, Any]:
-        """Delete a content property from a page."""
-        return self.get_conn().delete_page_property(page_id=page_id, page_property=page_property)
-
-    # Restrictions
-
-    def get_all_restrictions_for_content(self, content_id: str) -> dict[str, Any]:
-        """Return the restrictions on a piece of content, grouped by operation."""
-        return self.get_conn().get_all_restrictions_for_content(content_id=content_id)
-
-    # Folders, databases and whiteboards (Confluence Cloud v2 API)
-
-    def create_folder(self, space_id: str, title: str, parent_id: str | None = None) -> dict[str, Any]:
-        """Create a folder in a space."""
-        data: dict[str, Any] = {"spaceId": space_id, "title": title}
-        if parent_id is not None:
-            data["parentId"] = parent_id
-        return self.get_conn().post("/api/v2/folders", data=data)
-
-    def get_folder(self, folder_id: str) -> dict[str, Any] | None:
-        """Return a folder by its ID."""
-        return self.get_conn().get(f"/api/v2/folders/{folder_id}")
-
-    def delete_folder(self, folder_id: str) -> dict[str, Any] | None:
-        """Delete a folder. Confluence returns an empty body, so the result is usually ``None``."""
-        return self.get_conn().delete(f"/api/v2/folders/{folder_id}")
-
-    def create_database(self, space_id: str, title: str, parent_id: str | None = None) -> dict[str, Any]:
-        """Create a database in a space."""
-        data: dict[str, Any] = {"spaceId": space_id, "title": title}
-        if parent_id is not None:
-            data["parentId"] = parent_id
-        return self.get_conn().post("/api/v2/databases", data=data)
-
-    def get_database(self, database_id: str) -> dict[str, Any] | None:
-        """Return a database by its ID."""
-        return self.get_conn().get(f"/api/v2/databases/{database_id}")
-
-    def delete_database(self, database_id: str) -> dict[str, Any] | None:
-        """Delete a database. Confluence returns an empty body, so the result is usually ``None``."""
-        return self.get_conn().delete(f"/api/v2/databases/{database_id}")
-
-    def create_whiteboard(
-        self, space_id: str, title: str | None = None, parent_id: str | None = None
-    ) -> dict[str, Any]:
-        """Create a whiteboard in a space."""
-        return self.get_conn().create_whiteboard(spaceId=space_id, title=title, parentId=parent_id)
-
-    def get_whiteboard(self, whiteboard_id: str) -> dict[str, Any]:
-        """Return a whiteboard by its ID."""
-        return self.get_conn().get_whiteboard(whiteboard_id)
-
-    def delete_whiteboard(self, whiteboard_id: str) -> dict[str, Any]:
-        """Delete a whiteboard."""
-        return self.get_conn().delete_whiteboard(whiteboard_id)
+        return response.get("results", [])

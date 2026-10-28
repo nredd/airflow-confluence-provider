@@ -1,4 +1,3 @@
-#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -20,34 +19,45 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from airflow.providers.atlassian.confluence.hooks.confluence import ConfluenceHook
+from airflow.providers.atlassian.confluence.hooks.confluence import (
+    IF_EXISTS_CHOICES,
+    ConfluenceContent,
+    ConfluenceHook,
+    IfExists,
+)
 from airflow.providers.common.compat.sdk import BaseOperator
 
 if TYPE_CHECKING:
     from airflow.providers.common.compat.sdk import Context
 
 
+def _check_if_exists(if_exists: str) -> None:
+    if if_exists not in IF_EXISTS_CHOICES:
+        raise ValueError(f"`if_exists` must be one of {', '.join(IF_EXISTS_CHOICES)}, got {if_exists!r}")
+
+
 class ConfluenceOperator(BaseOperator):
     """
-    Call an arbitrary Atlassian Confluence SDK method.
+    Call an arbitrary method on the Atlassian Confluence SDK client.
 
-    This is the escape hatch for anything the more focused operators do not cover: it
-    exposes the whole SDK surface without a per-method wrapper. For details of the
-    available methods see
-    https://atlassian-python-api.readthedocs.io/confluence.html
+    This is the escape hatch for anything the page and blog post operators do not cover. The
+    method is looked up on ``ConfluenceHook.get_conn()``, which is a ``ConfluenceV2`` client
+    on Confluence Cloud and a ``ConfluenceServer`` client on Data Center. For the available
+    methods see https://atlassian-python-api.readthedocs.io/confluence.html
+
+    The return value is pushed to XCom. Methods that return generators or bytes (e.g.
+    exports) cannot be stored there: give a ``result_processor`` that turns the result into
+    something serializable, or set ``do_xcom_push=False``.
 
     .. seealso::
-        For creating or updating pages prefer :class:`ConfluencePageOperator`, which
-        resolves parent pages and upserts by title.
+        To publish pages or blog posts use :class:`ConfluencePageOperator` and
+        :class:`ConfluenceBlogPostOperator`.
 
-    :param confluence_method: name of the method to call on the Confluence SDK client
-    :param confluence_conn_id: reference to a pre-defined Confluence Connection
+    :param confluence_method: name of the method to call on the SDK client
     :param confluence_method_args: keyword arguments for ``confluence_method`` (templated)
-    :param result_processor: called with ``(context, result)`` to post-process the
-        response; its return value becomes the operator's return value
-    :param get_confluence_resource_method: callable (or another
-        :class:`ConfluenceOperator`) returning the object to call ``confluence_method``
-        on, instead of the top-level SDK client
+    :param result_processor: called with ``(context, result)``; its return value becomes the
+        operator's return value
+    :param confluence_conn_id: reference to a pre-defined Confluence Connection (templated)
     """
 
     template_fields: Sequence[str] = ("confluence_method_args", "confluence_conn_id")
@@ -56,29 +66,20 @@ class ConfluenceOperator(BaseOperator):
         self,
         *,
         confluence_method: str,
-        confluence_conn_id: str = ConfluenceHook.default_conn_name,
         confluence_method_args: dict | None = None,
-        result_processor: Callable | None = None,
-        get_confluence_resource_method: Callable | None = None,
+        result_processor: Callable[[Context, Any], Any] | None = None,
+        confluence_conn_id: str = ConfluenceHook.default_conn_name,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self.confluence_conn_id = confluence_conn_id
-        self.method_name = confluence_method
+        self.confluence_method = confluence_method
         self.confluence_method_args = confluence_method_args or {}
         self.result_processor = result_processor
-        self.get_confluence_resource_method = get_confluence_resource_method
+        self.confluence_conn_id = confluence_conn_id
 
     def execute(self, context: Context) -> Any:
-        if self.get_confluence_resource_method is not None:
-            if isinstance(self.get_confluence_resource_method, ConfluenceOperator):
-                resource = self.get_confluence_resource_method.execute(**context)
-            else:
-                resource = self.get_confluence_resource_method(**context)
-        else:
-            resource = ConfluenceHook(confluence_conn_id=self.confluence_conn_id).get_conn()
-
-        result: Any = getattr(resource, self.method_name)(**self.confluence_method_args)
+        client = ConfluenceHook(confluence_conn_id=self.confluence_conn_id).get_conn()
+        result = getattr(client, self.confluence_method)(**self.confluence_method_args)
 
         if self.result_processor:
             return self.result_processor(context, result)
@@ -87,28 +88,36 @@ class ConfluenceOperator(BaseOperator):
 
 class ConfluencePageOperator(BaseOperator):
     """
-    Publish a Confluence page, creating it or updating it in place if the title exists.
+    Publish a Confluence page.
 
-    The page can be placed under a parent identified either by ``parent_id`` or, when
-    only its title is known, by ``parent_title`` — which is resolved against the pages
-    of ``space``. Give at most one of the two.
+    The page is looked up by title within ``space``. A missing page is created, and an existing
+    one is handled according to ``if_exists``: updated in place, left alone, or reported as
+    an error. An update keeps the page wherever it already lives in the page tree, so the
+    parent only applies when the page is created.
+
+    Give the parent as ``parent_id`` or, when only its title is known, as ``parent_title``,
+    which is resolved within ``space``. Give at most one of the two.
+
+    The return value, pushed to XCom, is a ``ConfluenceContent`` dictionary with the keys
+    ``id``, ``type``, ``title``, ``space``, ``version``, ``url`` and ``action`` (``created``,
+    ``updated`` or ``skipped``).
 
     Conflicting concurrent writes surface as ``atlassian.errors.ApiConflictError``
     (HTTP 409); set ``retries`` on the task to have Airflow retry them.
 
-    :param space: key of the space to publish into
-    :param title: title of the page to create or update (templated)
-    :param body: page body in the format given by ``representation`` (templated)
-    :param confluence_conn_id: reference to a pre-defined Confluence Connection
-    :param parent_id: content ID of the parent page (templated)
-    :param parent_title: title of the parent page, resolved to an ID within ``space``
-        (templated); mutually exclusive with ``parent_id``
-    :param representation: body markup format, either ``storage`` or ``wiki``
-    :param minor_edit: when set, watchers are not notified about the change
-    :param version_comment: comment recorded against the new page version
+    :param space: key of the space to publish into (templated)
+    :param title: title of the page (templated)
+    :param body: page body in storage format (templated)
+    :param parent_id: content ID of the parent page, used on creation (templated)
+    :param parent_title: title of the parent page, resolved within ``space`` (templated);
+        mutually exclusive with ``parent_id``
+    :param if_exists: ``update`` (default), ``skip`` or ``fail``
+    :param version_comment: comment recorded against the new version on update (templated)
+    :param confluence_conn_id: reference to a pre-defined Confluence Connection (templated)
     """
 
     template_fields: Sequence[str] = (
+        "space",
         "title",
         "body",
         "parent_id",
@@ -124,73 +133,70 @@ class ConfluencePageOperator(BaseOperator):
         space: str,
         title: str,
         body: str,
-        confluence_conn_id: str = ConfluenceHook.default_conn_name,
         parent_id: str | None = None,
         parent_title: str | None = None,
-        representation: str = "storage",
-        minor_edit: bool = False,
+        if_exists: IfExists = "update",
         version_comment: str | None = None,
+        confluence_conn_id: str = ConfluenceHook.default_conn_name,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self.confluence_conn_id = confluence_conn_id
+        _check_if_exists(if_exists)
         self.space = space
         self.title = title
         self.body = body
         self.parent_id = parent_id
         self.parent_title = parent_title
-        self.representation = representation
-        self.minor_edit = minor_edit
+        self.if_exists = if_exists
         self.version_comment = version_comment
+        self.confluence_conn_id = confluence_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
-        # Checked here rather than in __init__ because both fields are templated, so
-        # before rendering they may still hold Jinja expressions.
-        if self.parent_id and self.parent_title:
-            raise ValueError("Give at most one of `parent_id` and `parent_title`, not both")
-
+    def execute(self, context: Context) -> ConfluenceContent:
         hook = ConfluenceHook(confluence_conn_id=self.confluence_conn_id)
-        parent_id = self.parent_id
-        if self.parent_title:
-            parent_id = hook.get_conn().get_page_id(space=self.space, title=self.parent_title)
-            if not parent_id:
-                raise ValueError(
-                    f"Parent page titled {self.parent_title!r} was not found in space {self.space!r}"
-                )
-
-        result = hook.get_or_create_page(
-            space=self.space,
-            title=self.title,
-            body=self.body,
-            parent_id=parent_id,
-            representation=self.representation,
-            minor_edit=self.minor_edit,
+        return hook.publish(
+            self.space,
+            self.title,
+            self.body,
+            content_type="page",
+            parent_id=self.parent_id,
+            parent_title=self.parent_title,
+            if_exists=self.if_exists,
             version_comment=self.version_comment,
         )
-        self.log.info("Published Confluence page %r (id %s)", self.title, result.get("id"))
-        return result
 
 
 class ConfluenceBlogPostOperator(BaseOperator):
     """
-    Publish a Confluence blog post, creating it or updating it in place if the title exists.
+    Publish a Confluence blog post.
 
-    Blog posts are flat within a space, so unlike :class:`ConfluencePageOperator` there
-    is no parent to resolve.
+    Blog posts are flat within a space, so unlike :class:`ConfluencePageOperator` there is no
+    parent. The post is looked up by title within ``space``; a missing post is created and an
+    existing one is handled according to ``if_exists``.
 
-    Conflicting concurrent writes surface as ``atlassian.errors.ApiConflictError``
-    (HTTP 409); set ``retries`` on the task to have Airflow retry them.
+    .. warning::
+        Blog post titles are not unique: a recurring post such as "Weekly report" usually
+        reuses its title. With the default ``if_exists="update"`` each run overwrites the
+        earlier post with that title. Put a date in the title (e.g. ``"Report {{ ds }}"``) to
+        publish one post per run, or choose ``skip`` or ``fail`` deliberately.
 
-    :param space: key of the space to publish into
-    :param title: title of the blog post to create or update (templated)
-    :param body: post body in the format given by ``representation`` (templated)
-    :param confluence_conn_id: reference to a pre-defined Confluence Connection
-    :param representation: body markup format, either ``storage`` or ``wiki``
-    :param minor_edit: when set, watchers are not notified about the change
-    :param version_comment: comment recorded against the new version
+    The return value, pushed to XCom, is a ``ConfluenceContent`` dictionary; see
+    :class:`ConfluencePageOperator`.
+
+    :param space: key of the space to publish into (templated)
+    :param title: title of the blog post (templated)
+    :param body: post body in storage format (templated)
+    :param if_exists: ``update`` (default), ``skip`` or ``fail``
+    :param version_comment: comment recorded against the new version on update (templated)
+    :param confluence_conn_id: reference to a pre-defined Confluence Connection (templated)
     """
 
-    template_fields: Sequence[str] = ("title", "body", "version_comment", "confluence_conn_id")
+    template_fields: Sequence[str] = (
+        "space",
+        "title",
+        "body",
+        "version_comment",
+        "confluence_conn_id",
+    )
     template_fields_renderers = {"body": "html"}
 
     def __init__(
@@ -199,30 +205,27 @@ class ConfluenceBlogPostOperator(BaseOperator):
         space: str,
         title: str,
         body: str,
-        confluence_conn_id: str = ConfluenceHook.default_conn_name,
-        representation: str = "storage",
-        minor_edit: bool = False,
+        if_exists: IfExists = "update",
         version_comment: str | None = None,
+        confluence_conn_id: str = ConfluenceHook.default_conn_name,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self.confluence_conn_id = confluence_conn_id
+        _check_if_exists(if_exists)
         self.space = space
         self.title = title
         self.body = body
-        self.representation = representation
-        self.minor_edit = minor_edit
+        self.if_exists = if_exists
         self.version_comment = version_comment
+        self.confluence_conn_id = confluence_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> ConfluenceContent:
         hook = ConfluenceHook(confluence_conn_id=self.confluence_conn_id)
-        result = hook.get_or_create_blog_post(
-            space=self.space,
-            title=self.title,
-            body=self.body,
-            representation=self.representation,
-            minor_edit=self.minor_edit,
+        return hook.publish(
+            self.space,
+            self.title,
+            self.body,
+            content_type="blogpost",
+            if_exists=self.if_exists,
             version_comment=self.version_comment,
         )
-        self.log.info("Published Confluence blog post %r (id %s)", self.title, result.get("id"))
-        return result

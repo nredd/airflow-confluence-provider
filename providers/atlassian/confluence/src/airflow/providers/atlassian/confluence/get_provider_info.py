@@ -61,22 +61,30 @@ def get_provider_info():
                 "hook-name": "Confluence",
                 "connection-type": "confluence",
                 "conn-fields": {
+                    "deployment": {
+                        "label": "Deployment",
+                        "schema": {
+                            "type": ["string", "null"],
+                            "enum": ["auto", "cloud", "data_center"],
+                            "default": "auto",
+                        },
+                        "description": "auto (default) treats hosts ending in atlassian.net, jira.com or api.atlassian.com as Confluence Cloud and everything else as Data Center. Set cloud or data_center to override the detection, e.g. for a Cloud site on a custom domain.",
+                    },
+                    "token": {
+                        "label": "Data Center Personal Access Token",
+                        "schema": {"type": ["string", "null"], "format": "password"},
+                        "description": "Personal Access Token for Confluence Data Center, sent as a Bearer token. When set it takes precedence over Login and Password. Not valid for Confluence Cloud: use the account email as Login and the API token as Password there.",
+                    },
                     "verify": {
                         "label": "Verify SSL",
                         "schema": {"type": ["boolean", "null"], "default": True},
                     },
-                    "token": {
-                        "label": "API token / Personal Access Token",
-                        "schema": {"type": ["string", "null"], "format": "password"},
-                        "description": "Confluence Cloud API token or Data Center Personal Access Token. When set, it takes precedence over Login/Password and is used as the sole credential.\n",
-                    },
-                    "cloud": {
-                        "label": "Confluence Cloud",
-                        "schema": {"type": ["boolean", "null"], "default": False},
-                        "description": "Set for Confluence Cloud instances. Atlassian-hosted URLs are detected automatically, so this is only needed for Cloud instances behind a custom domain.\n",
-                    },
                 },
-                "ui-field-behaviour": {"hidden-fields": ["schema"]},
+                "ui-field-behaviour": {
+                    "hidden-fields": ["schema"],
+                    "relabeling": {"login": "Username / Email", "password": "Password / API token"},
+                    "placeholders": {"host": "https://example.atlassian.net/wiki"},
+                },
             }
         ],
     }

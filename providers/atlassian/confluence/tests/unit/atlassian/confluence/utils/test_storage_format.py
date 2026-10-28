@@ -20,12 +20,47 @@ from __future__ import annotations
 import pytest
 
 from airflow.providers.atlassian.confluence.utils.storage_format import (
+    StorageFormat,
     build_code_block_macro,
     build_expand_macro,
     build_panel_macro,
     build_status_lozenge,
     build_table,
+    escape_text,
 )
+
+
+class TestEscapeText:
+    def test_plain_text_is_escaped(self):
+        result = escape_text('<a href="x">\'&</a>')
+
+        assert result == "&lt;a href=&quot;x&quot;&gt;&#x27;&amp;&lt;/a&gt;"
+        assert isinstance(result, StorageFormat)
+
+    def test_storage_format_is_returned_untouched(self):
+        markup = StorageFormat("<b>bold</b>")
+
+        assert escape_text(markup) is markup
+
+    def test_non_strings_are_converted(self):
+        assert escape_text(42) == "42"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("a\x00b\x08c\x0bd\x0ce\x1ff", "abcdef"),
+            ("tab\tnewline\ncr\r", "tab\tnewline\ncr\r"),
+            ("a\ufffe\uffffb", "ab"),
+            ("a\ud800b", "ab"),
+        ],
+    )
+    def test_xml_invalid_characters_are_stripped(self, raw, expected):
+        assert escape_text(raw) == expected
+
+    def test_storage_format_supports_the_html_protocol(self):
+        markup = StorageFormat("<b>bold</b>")
+
+        assert markup.__html__() is markup
 
 
 class TestBuildTable:
@@ -59,8 +94,19 @@ class TestBuildTable:
 
     def test_text_is_escaped(self):
         assert build_table(["<h&>"], [['a"b']]) == (
-            '<table><tbody><tr><th>&lt;h&amp;&gt;</th></tr><tr><td>a"b</td></tr></tbody></table>'
+            "<table><tbody><tr><th>&lt;h&amp;&gt;</th></tr><tr><td>a&quot;b</td></tr></tbody></table>"
         )
+
+    def test_highlight_colour_drops_xml_invalid_characters(self):
+        table = build_table(["A"], [["1"]], cell_highlight_colors={(0, 0): "#e3\x00fcef"})
+
+        assert 'data-highlight-colour="#e3fcef"' in table
+
+    def test_builder_output_nests_in_cells_without_double_escaping(self):
+        table = build_table(["Check"], [[build_status_lozenge("Done", color="green")]])
+
+        assert "<td><ac:structured-macro" in table
+        assert "&lt;" not in table
 
     def test_highlight_colour_is_quoted_safely(self):
         table = build_table(["A"], [["1"]], cell_highlight_colors={(0, 0): 'red"; x'})
@@ -94,8 +140,20 @@ class TestBuildPanelMacro:
         assert "a&lt;b" in panel
         assert "x&amp;y" in panel
 
+    def test_builder_output_nests_in_the_body(self):
+        table = build_table(["A"], [["1"]])
+
+        panel = build_panel_macro(table, panel_type="note")
+
+        assert f"<ac:rich-text-body>{table}</ac:rich-text-body>" in panel
+
 
 class TestBuildExpandMacro:
+    def test_builder_output_nests_in_the_body(self):
+        panel = build_panel_macro("inner", panel_type="info")
+
+        assert f"<ac:rich-text-body>{panel}</ac:rich-text-body>" in build_expand_macro("More", panel)
+
     def test_title_and_body(self):
         assert build_expand_macro("More", "hidden") == (
             '<ac:structured-macro ac:name="expand">'
@@ -125,6 +183,9 @@ class TestBuildCodeBlockMacro:
     def test_cdata_terminator_in_code_is_split_across_sections(self):
         assert "<![CDATA[a]]]]><![CDATA[>b]]>" in build_code_block_macro("a]]>b")
 
+    def test_xml_invalid_characters_are_stripped_from_code(self):
+        assert "<![CDATA[ab]]>" in build_code_block_macro("a\x00b")
+
     def test_code_itself_is_not_xml_escaped(self):
         assert "if a < b:" in build_code_block_macro("if a < b:")
 
@@ -137,6 +198,17 @@ class TestBuildStatusLozenge:
             '<ac:parameter ac:name="title">Done</ac:parameter>'
             "</ac:structured-macro>"
         )
+
+    def test_every_builder_returns_storage_format(self):
+        results = [
+            build_table(["A"], [["1"]]),
+            build_panel_macro("b", panel_type="info"),
+            build_expand_macro("t", "b"),
+            build_code_block_macro("x"),
+            build_status_lozenge("s"),
+        ]
+
+        assert all(isinstance(result, StorageFormat) for result in results)
 
     def test_colour_defaults_to_grey(self):
         assert '<ac:parameter ac:name="colour">Grey</ac:parameter>' in build_status_lozenge("Pending")
