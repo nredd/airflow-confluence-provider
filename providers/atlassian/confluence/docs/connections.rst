@@ -53,7 +53,8 @@ Host
     The full base URL of the Confluence site, including the scheme and any context path, for
     example ``https://example.atlassian.net/wiki`` for Cloud or
     ``https://confluence.example.com/confluence`` for Data Center. Without a scheme, ``https``
-    is assumed. Trailing slashes are ignored.
+    is assumed. Trailing slashes are ignored. On Cloud, ``/wiki`` is appended when the path
+    does not already start with it, including Cloud sites behind a custom domain.
 
 Port
     Optional port. It is applied only when the host URL does not already contain one, so a

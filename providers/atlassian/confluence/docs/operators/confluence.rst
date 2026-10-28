@@ -70,8 +70,8 @@ API response:
         "action": "updated",  # "created", "updated" or "skipped"
     }
 
-Concurrent writes to the same page surface as ``atlassian.errors.ApiConflictError``
-(HTTP 409). The operator does not retry them; set ``retries`` on the task instead, so retry
+Concurrent writes to the same page surface as ``requests.HTTPError`` with
+``response.status_code == 409``. The operator does not retry them; set ``retries`` on the task instead, so retry
 behavior stays visible in the Dag rather than hidden in the operator.
 
 .. _howto/operator:ConfluenceBlogPostOperator:

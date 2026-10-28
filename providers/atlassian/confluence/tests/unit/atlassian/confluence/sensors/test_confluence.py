@@ -22,6 +22,7 @@ from unittest import mock
 import pytest
 from atlassian import ConfluenceServer
 
+from airflow.providers.atlassian.confluence.exceptions import ConfluenceSpaceNotFoundError
 from airflow.providers.atlassian.confluence.sensors.confluence import (
     ConfluencePageSensor,
     ConfluenceSensor,
@@ -85,6 +86,12 @@ class TestConfluencePageSensor:
         hook_cls.return_value.find_content.assert_called_once_with(
             "SPACE", "Report", content_type=content_type
         )
+
+    def test_missing_space_means_not_yet(self, hook_cls):
+        hook_cls.return_value.find_content.side_effect = ConfluenceSpaceNotFoundError("gone")
+        sensor = ConfluencePageSensor(task_id="wait", space="SPACE", title="Report")
+
+        assert sensor.poke(context={}) is False
 
     def test_space_and_title_are_templated(self, hook_cls):
         sensor = ConfluencePageSensor(task_id="wait", space="{{ space }}", title="Report {{ ds }}")

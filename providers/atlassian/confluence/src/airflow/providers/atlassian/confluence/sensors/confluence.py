@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
+from airflow.providers.atlassian.confluence.exceptions import ConfluenceSpaceNotFoundError
 from airflow.providers.atlassian.confluence.hooks.confluence import ConfluenceHook, ContentType
 from airflow.providers.common.compat.sdk import BaseSensorOperator
 
@@ -99,4 +100,9 @@ class ConfluencePageSensor(BaseSensorOperator):
 
     def poke(self, context: Context) -> bool:
         hook = ConfluenceHook(confluence_conn_id=self.confluence_conn_id)
-        return hook.find_content(self.space, self.title, content_type=self.content_type) is not None
+        try:
+            return hook.find_content(self.space, self.title, content_type=self.content_type) is not None
+        except ConfluenceSpaceNotFoundError:
+            # Only Cloud resolves the space up front; on both deployments a missing space means
+            # the content does not exist yet.
+            return False

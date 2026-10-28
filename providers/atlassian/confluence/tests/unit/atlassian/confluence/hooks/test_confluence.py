@@ -31,6 +31,7 @@ from airflow.providers.atlassian.confluence.exceptions import (
     ConfluenceConnectionError,
     ConfluenceContentExistsError,
     ConfluenceContentNotFoundError,
+    ConfluenceError,
     ConfluenceSpaceNotFoundError,
 )
 from airflow.providers.atlassian.confluence.get_provider_info import get_provider_info
@@ -165,6 +166,27 @@ class TestConnection:
         sdk.cloud_ctor.assert_not_called()
 
     @pytest.mark.parametrize(
+        ("host", "extra", "expected"),
+        [
+            ("https://example.atlassian.net", None, "https://example.atlassian.net/wiki"),
+            ("https://example.atlassian.net/wiki/", None, "https://example.atlassian.net/wiki"),
+            ("https://wikiteam.atlassian.net", None, "https://wikiteam.atlassian.net/wiki"),
+            ("https://docs.example.com", {"deployment": "cloud"}, "https://docs.example.com/wiki"),
+            (
+                "https://api.atlassian.com/ex/confluence/abc123",
+                None,
+                "https://api.atlassian.com/ex/confluence/abc123",
+            ),
+        ],
+    )
+    def test_cloud_url_points_at_the_wiki_context_path(self, sdk, set_connection, host, extra, expected):
+        set_connection(host=host, extra=extra)
+
+        ConfluenceHook().get_conn()
+
+        assert sdk.cloud_ctor.call_args.kwargs["url"] == expected
+
+    @pytest.mark.parametrize(
         ("host", "port", "schema", "expected"),
         [
             ("confluence.example.com", None, None, "https://confluence.example.com"),
@@ -248,11 +270,16 @@ class TestFormWidgets:
         widgets = ConfluenceHook.get_connection_form_widgets()
 
         assert set(widgets) == {"deployment", "token", "verify"}
-        assert [value for value, _ in widgets["deployment"].kwargs["choices"]] == [
-            "auto",
-            "cloud",
-            "data_center",
-        ]
+        assert widgets["deployment"].kwargs["default"] == "auto"
+
+    def test_widgets_use_field_classes_airflow_3_0_accepts(self):
+        wtforms = pytest.importorskip("wtforms")
+        # Airflow 3.0/3.1 drop the whole hook from discovery for any other field class.
+        allowed = {wtforms.BooleanField, wtforms.IntegerField, wtforms.PasswordField, wtforms.StringField}
+
+        widgets = ConfluenceHook.get_connection_form_widgets()
+
+        assert {widget.field_class for widget in widgets.values()} <= allowed
 
     def test_no_widgets_without_wtforms(self):
         with mock.patch.dict(sys.modules, {"wtforms": None}):
@@ -291,6 +318,15 @@ class TestTestConnection:
 
         assert ConfluenceHook().test_connection() == (True, "Connection successfully tested")
         client.get.assert_called_once_with("rest/api/user/current")
+
+    def test_non_json_response_fails(self, sdk, set_connection):
+        set_connection()
+        sdk.server.get.return_value = "<html>Log in</html>"
+
+        success, message = ConfluenceHook().test_connection()
+
+        assert not success
+        assert "non-JSON response" in message
 
     def test_anonymous_user_fails(self, sdk, set_connection):
         set_connection()
@@ -428,6 +464,14 @@ class TestFindContent:
         assert content is not None
         assert content["type"] == "blogpost"
 
+    def test_non_json_response_raises(self, deployment):
+        deployment.stub_content()
+        deployment.client.get.side_effect = None
+        deployment.client.get.return_value = "<html>Log in</html>"
+
+        with pytest.raises(ConfluenceError, match="non-JSON response"):
+            deployment.hook.find_content("SPACE", "Report")
+
     def test_missing_content_returns_none(self, deployment):
         deployment.stub_content()
 
@@ -482,6 +526,13 @@ class TestFindContent:
 
         spaces_calls = [c for c in sdk.cloud.get.call_args_list if c.args[0] == "api/v2/spaces"]
         assert len(spaces_calls) == 1
+
+
+def _create_params(deployment: Deployment, content_type: str, parent_id: str | None) -> dict[str, str] | None:
+    # Cloud nests parentless pages under the space homepage unless asked for the top level.
+    if deployment.is_cloud and content_type == "page" and not parent_id:
+        return {"root-level": "true"}
+    return None
 
 
 def _create_payload(deployment: Deployment, content_type: str, parent_id: str | None) -> dict[str, Any]:
@@ -541,7 +592,9 @@ class TestPublish:
         )
 
         deployment.client.post.assert_called_once_with(
-            _collection(deployment, content_type), data=_create_payload(deployment, content_type, parent_id)
+            _collection(deployment, content_type),
+            data=_create_payload(deployment, content_type, parent_id),
+            params=_create_params(deployment, content_type, parent_id),
         )
         deployment.client.put.assert_not_called()
         assert result == {
@@ -620,7 +673,7 @@ class TestPublish:
         assert [call.kwargs["params"]["title"] for call in deployment.content_calls()] == ["Report", "Parent"]
         assert deployment.content_calls()[1].kwargs["params"] == _find_params(deployment, "Parent")
         deployment.client.post.assert_called_once_with(
-            _collection(deployment), data=_create_payload(deployment, "page", "77")
+            _collection(deployment), data=_create_payload(deployment, "page", "77"), params=None
         )
 
     def test_missing_parent_title_raises(self, deployment):

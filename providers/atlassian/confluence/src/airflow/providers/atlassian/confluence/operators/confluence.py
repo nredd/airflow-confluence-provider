@@ -102,8 +102,8 @@ class ConfluencePageOperator(BaseOperator):
     ``id``, ``type``, ``title``, ``space``, ``version``, ``url`` and ``action`` (``created``,
     ``updated`` or ``skipped``).
 
-    Conflicting concurrent writes surface as ``atlassian.errors.ApiConflictError``
-    (HTTP 409); set ``retries`` on the task to have Airflow retry them.
+    Conflicting concurrent writes surface as ``requests.HTTPError`` with status 409; set
+    ``retries`` on the task to have Airflow retry them.
 
     :param space: key of the space to publish into (templated)
     :param title: title of the page (templated)

@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, get_args
 from urllib.parse import urlsplit, urlunsplit
 
 from atlassian import ConfluenceServer, ConfluenceV2
@@ -33,6 +33,7 @@ from airflow.providers.atlassian.confluence.exceptions import (
     ConfluenceConnectionError,
     ConfluenceContentExistsError,
     ConfluenceContentNotFoundError,
+    ConfluenceError,
     ConfluenceSpaceNotFoundError,
 )
 from airflow.providers.common.compat.sdk import BaseHook
@@ -44,7 +45,7 @@ ContentType = Literal["page", "blogpost"]
 IfExists = Literal["update", "skip", "fail"]
 Action = Literal["created", "updated", "skipped"]
 
-IF_EXISTS_CHOICES: tuple[str, ...] = ("update", "skip", "fail")
+IF_EXISTS_CHOICES: tuple[str, ...] = get_args(IfExists)
 
 # Hostnames (and their subdomains) that the SDK itself treats as Confluence Cloud.
 _CLOUD_DOMAINS = ("atlassian.net", "jira.com", "api.atlassian.com")
@@ -100,6 +101,24 @@ def _build_base_url(conn: Connection) -> str:
     return urlunsplit(parts._replace(netloc=netloc, path=parts.path.rstrip("/")))
 
 
+def _add_cloud_wiki_path(url: str) -> str:
+    """Point a Cloud URL at the Confluence context path."""
+    # The SDK only appends ``/wiki`` to atlassian.net hosts, and skips it whenever the URL
+    # contains ``/wiki`` anywhere, e.g. ``https://wikiteam.atlassian.net``.
+    parts = urlsplit(url)
+    path = parts.path
+    if path == "/wiki" or path.startswith(("/wiki/", "/ex/confluence/")):
+        return url
+    return urlunsplit(parts._replace(path=f"{path}/wiki"))
+
+
+def _require_json_object(path: str, response: Any) -> dict[str, Any]:
+    # The SDK returns the raw text for non-JSON bodies, e.g. an SSO login page served with 200.
+    if not isinstance(response, dict):
+        raise ConfluenceError(f"Confluence returned a non-JSON response for {path!r}")
+    return response
+
+
 def _quote_cql(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
@@ -124,6 +143,8 @@ def _resolve_connection_settings(conn: Connection) -> _ConnectionSettings:
 
     url = _build_base_url(conn)
     cloud = _is_cloud_hostname(url) if deployment == "auto" else deployment == "cloud"
+    if cloud:
+        url = _add_cloud_wiki_path(url)
     token = extras.get("token") or None
 
     if cloud:
@@ -178,13 +199,27 @@ class _ContentApi(ABC):
         """Delete content by ID."""
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        return cast("dict[str, Any]", self._client.get(path, params=params))
+        return _require_json_object(path, self._client.get(path, params=params))
 
-    def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
-        return cast("dict[str, Any]", self._client.post(path, data=data))
+    def _post(self, path: str, data: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _require_json_object(path, self._client.post(path, data=data, params=params))
 
     def _put(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
-        return cast("dict[str, Any]", self._client.put(path, data=data))
+        return _require_json_object(path, self._client.put(path, data=data))
+
+    def _summarize_first(
+        self, response: dict[str, Any], *, space: str, content_type: ContentType
+    ) -> ConfluenceContent | None:
+        results = response.get("results") or []
+        if not results:
+            return None
+        return self._summarize(
+            results[0],
+            space=space,
+            content_type=content_type,
+            action="skipped",
+            list_base=(response.get("_links") or {}).get("base"),
+        )
 
     @staticmethod
     def _summarize(
@@ -234,16 +269,7 @@ class _DataCenterContentApi(_ContentApi):
                     "limit": 1,
                 },
             )
-        results = response.get("results") or []
-        if not results:
-            return None
-        return self._summarize(
-            results[0],
-            space=space,
-            content_type=content_type,
-            action="skipped",
-            list_base=(response.get("_links") or {}).get("base"),
-        )
+        return self._summarize_first(response, space=space, content_type=content_type)
 
     def create(
         self, space: str, title: str, body: str, content_type: ContentType, parent_id: str | None
@@ -291,16 +317,7 @@ class _CloudContentApi(_ContentApi):
             self._COLLECTIONS[content_type],
             {"space-id": self._get_space_id(space), "title": title, "status": "current", "limit": 1},
         )
-        results = response.get("results") or []
-        if not results:
-            return None
-        return self._summarize(
-            results[0],
-            space=space,
-            content_type=content_type,
-            action="skipped",
-            list_base=(response.get("_links") or {}).get("base"),
-        )
+        return self._summarize_first(response, space=space, content_type=content_type)
 
     def create(
         self, space: str, title: str, body: str, content_type: ContentType, parent_id: str | None
@@ -311,9 +328,14 @@ class _CloudContentApi(_ContentApi):
             "title": title,
             "body": {"representation": "storage", "value": body},
         }
+        params = None
         if parent_id:
             payload["parentId"] = parent_id
-        item = self._post(self._COLLECTIONS[content_type], payload)
+        elif content_type == "page":
+            # Without this, Cloud nests parentless pages under the space homepage; Data Center
+            # creates them at the top level of the space.
+            params = {"root-level": "true"}
+        item = self._post(self._COLLECTIONS[content_type], payload, params)
         return self._summarize(item, space=space, content_type=content_type, action="created")
 
     def update(
@@ -380,16 +402,14 @@ class ConfluenceHook(BaseHook):
         # Only needed on Airflow 3.0 and 3.1; remove once the Airflow floor reaches 3.2, where
         # the ``conn-fields`` in provider.yaml take over.
         try:
-            from wtforms import BooleanField, PasswordField, SelectField
+            from wtforms import BooleanField, PasswordField, StringField
         except ImportError:
             return {}
 
         return {
-            "deployment": SelectField(
-                "Deployment",
-                choices=[("auto", "Auto-detect"), ("cloud", "Cloud"), ("data_center", "Data Center")],
-                default="auto",
-            ),
+            # Airflow 3.0/3.1 drop the whole hook for any field class other than String,
+            # Integer, Password or Boolean, so the enum is validated when connecting.
+            "deployment": StringField("Deployment (auto, cloud or data_center)", default="auto"),
             "token": PasswordField("Data Center Personal Access Token"),
             "verify": BooleanField("Verify SSL", default=True),
         }
@@ -433,36 +453,26 @@ class ConfluenceHook(BaseHook):
         settings = self._settings
         self.log.debug("Creating Confluence client for conn_id: %s", self.confluence_conn_id)
 
+        common: dict[str, Any] = {"url": settings.url, "verify_ssl": settings.verify, "proxies": self.proxies}
+        if settings.token:
+            common["token"] = settings.token
+        else:
+            common.update(username=settings.login, password=settings.password)
+
         if settings.cloud:
             # ConfluenceV2 warns about its own legacy v1 methods on every construction, which
             # this hook never calls.
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
-                self._client = ConfluenceV2(
-                    url=settings.url,
-                    username=settings.login,
-                    password=settings.password,
-                    verify_ssl=settings.verify,
-                    proxies=self.proxies,
-                )
-        elif settings.token:
-            self._client = ConfluenceServer(
-                url=settings.url, token=settings.token, verify_ssl=settings.verify, proxies=self.proxies
-            )
+                self._client = ConfluenceV2(**common)
         else:
-            self._client = ConfluenceServer(
-                url=settings.url,
-                username=settings.login,
-                password=settings.password,
-                verify_ssl=settings.verify,
-                proxies=self.proxies,
-            )
+            self._client = ConfluenceServer(**common)
         return self._client
 
     def test_connection(self) -> tuple[bool, str]:
         """Check the credentials by fetching the current user."""
         try:
-            user = cast("dict[str, Any]", self.get_conn().get("rest/api/user/current"))
+            user = _require_json_object("rest/api/user/current", self.get_conn().get("rest/api/user/current"))
         except Exception as e:
             return False, str(e)
         if user.get("type") == "anonymous":
@@ -566,7 +576,7 @@ class ConfluenceHook(BaseHook):
         :param limit: maximum number of results to return
         :return: the ``results`` of the search response
         """
-        response = cast(
-            "dict[str, Any]", self.get_conn().get("rest/api/search", params={"cql": cql, "limit": limit})
+        response = _require_json_object(
+            "rest/api/search", self.get_conn().get("rest/api/search", params={"cql": cql, "limit": limit})
         )
         return response.get("results", [])
